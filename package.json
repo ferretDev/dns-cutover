@@ -1,0 +1,16 @@
+{
+  "name": "dns-cutover",
+  "version": "0.1.0",
+  "description": "Check + sync DNS zones from Enom to Cloudflare, then cut registrar NS over to Cloudflare",
+  "type": "module",
+  "bin": {
+    "dns-cutover": "./cli.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "cli": "node cli.js"
+  }
+}

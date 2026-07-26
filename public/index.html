@@ -1,0 +1,657 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dns-cutover</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --border: #30363d; --text: #e6edf3; --dim: #8b949e;
+    --green: #3fb950; --green-bg: rgba(63,185,80,.12);
+    --red: #f85149; --red-bg: rgba(248,81,73,.12);
+    --amber: #d29922; --amber-bg: rgba(210,153,34,.12);
+    --blue: #58a6ff; --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 -apple-system, "Segoe UI", sans-serif; }
+  header { display: flex; align-items: center; gap: 12px; padding: 12px 20px; border-bottom: 1px solid var(--border); position: sticky; top: 0; background: var(--bg); z-index: 5; }
+  header h1 { font-size: 16px; margin: 0; }
+  header h1 span { color: var(--dim); font-weight: 400; }
+  .spacer { flex: 1; }
+  button { background: #21262d; color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 5px 12px; cursor: pointer; font-size: 13px; }
+  button:hover { border-color: var(--dim); }
+  button:disabled { opacity: .45; cursor: default; }
+  button.primary { background: #238636; border-color: #2ea043; }
+  button.danger { background: #6e1a1a; border-color: var(--red); }
+  button.small { padding: 2px 8px; font-size: 12px; }
+  main { max-width: 1400px; margin: 0 auto; padding: 16px 20px 80px; }
+
+  /* settings */
+  #settings { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 16px; display: none; }
+  #settings.open { display: block; }
+  #settings .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 10px; }
+  #settings label { display: block; font-size: 12px; color: var(--dim); margin-bottom: 3px; }
+  #settings input, #settings select { width: 100%; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; color: var(--text); padding: 6px 8px; font-family: var(--mono); font-size: 12px; }
+  .testline { font-family: var(--mono); font-size: 12px; margin-top: 8px; }
+
+  /* batch bar */
+  #batchbar { display: flex; align-items: center; gap: 10px; padding: 8px 0; font-size: 13px; color: var(--dim); }
+
+  /* domain list */
+  .domain { border: 1px solid var(--border); border-radius: 8px; margin-bottom: 8px; background: var(--panel); overflow: hidden; }
+  .domain-head { display: flex; align-items: center; gap: 10px; padding: 9px 14px; cursor: pointer; user-select: none; }
+  .domain-head:hover { background: #1c2129; }
+  .domain-head .name { font-family: var(--mono); font-size: 14px; }
+  .badge { font-size: 11px; padding: 1px 8px; border-radius: 10px; border: 1px solid var(--border); color: var(--dim); }
+  .badge.active { color: var(--green); border-color: var(--green); }
+  .badge.pending { color: var(--amber); border-color: var(--amber); }
+  .badge.none { color: var(--red); border-color: var(--red); }
+  .badge.pointed { color: var(--blue); border-color: var(--blue); }
+
+  /* detail */
+  .detail { border-top: 1px solid var(--border); padding: 14px; display: none; }
+  .detail.open { display: block; }
+  .nsgrid { display: grid; grid-template-columns: 1fr 40px 1fr; gap: 0; margin-bottom: 12px; font-family: var(--mono); font-size: 12px; }
+  .nsbox { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 8px 12px; }
+  .nsbox h4 { margin: 0 0 4px; font: 600 11px/1 -apple-system, sans-serif; color: var(--dim); text-transform: uppercase; letter-spacing: .5px; }
+  .nsarrow { display: flex; align-items: center; justify-content: center; color: var(--dim); }
+  .nsbox.good { border-color: var(--green); }
+  .toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+  .toolbar .sep { width: 1px; height: 20px; background: var(--border); }
+
+  /* diff table */
+  table { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 12px; }
+  th { text-align: left; color: var(--dim); font: 600 11px/1 -apple-system, sans-serif; text-transform: uppercase; letter-spacing: .5px; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+  td { padding: 4px 8px; border-bottom: 1px solid #21262d; vertical-align: top; word-break: break-all; }
+  tr.same td.cell { background: var(--green-bg); }
+  tr.enom-only td.cell-enom { background: var(--red-bg); }
+  tr.cf-only td.cell-cf { background: var(--amber-bg); }
+  td.gap { color: #3d444d; text-align: center; }
+  td.stat { text-align: center; width: 34px; }
+  tr.same td.stat { color: var(--green); }
+  tr.enom-only td.stat { color: var(--red); }
+  tr.cf-only td.stat { color: var(--amber); }
+  .rectype { display: inline-block; min-width: 44px; color: var(--blue); }
+  .recname { color: var(--text); }
+  .reccontent { color: var(--dim); }
+  td.act { width: 60px; text-align: center; white-space: nowrap; }
+  td.sel { width: 26px; }
+
+  .warnings { margin-top: 10px; font-size: 12px; color: var(--amber); font-family: var(--mono); }
+  .errors { margin-top: 10px; font-size: 12px; color: var(--red); font-family: var(--mono); }
+
+  /* notices */
+  #notices { display: flex; flex-wrap: wrap; gap: 8px; padding: 4px 0 8px; }
+  .chip { font-size: 12px; padding: 3px 12px; border-radius: 12px; border: 1px solid var(--border); color: var(--text); cursor: pointer; user-select: none; background: var(--panel); }
+  .chip:hover { border-color: var(--dim); }
+  .chip.good { border-color: var(--green); }
+  .chip.bad { border-color: var(--red); }
+  .chip.warn { border-color: var(--amber); }
+  .chip.on { background: #253041; border-color: var(--blue); }
+  .badge.ready { color: var(--green); border-color: var(--green); }
+  .badge.mail { color: var(--amber); border-color: var(--amber); }
+
+  /* mail checklist */
+  .mailbox { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 8px 12px; margin-top: 12px; font-family: var(--mono); font-size: 12px; }
+  .mailbox h4 { margin: 0 0 6px; font: 600 11px/1 -apple-system, sans-serif; color: var(--dim); text-transform: uppercase; letter-spacing: .5px; }
+  .mailbox .mc-ok { color: var(--green); }
+  .mailbox .mc-gap { color: var(--red); }
+  .mailbox .mc-opt { color: var(--dim); }
+
+  /* toast */
+  #toast { position: fixed; bottom: 16px; right: 16px; display: flex; flex-direction: column; gap: 8px; z-index: 20; }
+  .toastmsg { background: var(--panel); border: 1px solid var(--border); border-left: 3px solid var(--blue); padding: 8px 14px; border-radius: 6px; font-size: 13px; max-width: 420px; }
+  .toastmsg.ok { border-left-color: var(--green); }
+  .toastmsg.err { border-left-color: var(--red); }
+  .loading { color: var(--dim); padding: 14px; }
+  input[type=checkbox] { accent-color: #238636; }
+</style>
+</head>
+<body>
+<header>
+  <h1>dns-cutover <span>· Enom → Cloudflare migration desk</span></h1>
+  <div class="spacer"></div>
+  <button id="btn-refresh">↻ Refresh domains</button>
+  <button id="btn-settings">⚙ API Keys</button>
+</header>
+
+<main>
+  <section id="settings">
+    <div class="grid">
+      <div><label>Enom UID</label><input id="cfg-ENOM_UID" autocomplete="off"></div>
+      <div><label>Enom password / API token</label><input id="cfg-ENOM_PW" type="password" autocomplete="off"></div>
+      <div><label>Enom environment</label>
+        <select id="cfg-ENOM_ENV"><option value="prod">prod (reseller.enom.com)</option><option value="test">test (resellertest.enom.com)</option></select>
+      </div>
+      <div><label>Cloudflare API token</label><input id="cfg-CF_API_TOKEN" type="password" autocomplete="off"></div>
+      <div><label>Cloudflare account ID</label><input id="cfg-CF_ACCOUNT_ID" autocomplete="off"></div>
+    </div>
+    <button class="primary" id="btn-save-cfg">Save keys</button>
+    <button id="btn-test-cfg">Test connections</button>
+    <span style="color:var(--dim);font-size:12px;margin-left:8px">Stored locally in config.json (gitignored, chmod 600). Leave a field blank to keep the current value.</span>
+    <div class="testline" id="testline"></div>
+  </section>
+
+  <div id="notices"></div>
+  <div id="batchbar">
+    <input type="checkbox" id="sel-all-domains" title="Select all visible">
+    <span id="sel-count">0 selected</span>
+    <button class="small primary" id="btn-batch-sync">Batch sync selected → Cloudflare</button>
+    <button class="small" id="btn-scan">🔍 Scan visible</button>
+    <span class="spacer"></span>
+    <input id="search" placeholder="filter…" style="background:var(--panel);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:4px 8px;font-family:var(--mono);font-size:12px;width:160px">
+    <select id="filter-status" style="background:var(--panel);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:4px 6px;font-size:12px">
+      <option value="">all statuses</option>
+      <option value="pending">pending (work these first)</option>
+      <option value="none">no CF zone</option>
+      <option value="active">active</option>
+    </select>
+    <select id="sort-by" style="background:var(--panel);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:4px 6px;font-size:12px">
+      <option value="status">sort: status (pending first)</option>
+      <option value="name">sort: name</option>
+    </select>
+    <span id="domain-count"></span>
+  </div>
+
+  <div id="domains"><div class="loading">Loading domains…</div></div>
+</main>
+
+<div id="toast"></div>
+
+<script>
+const $ = (sel, el = document) => el.querySelector(sel);
+const $$ = (sel, el = document) => [...el.querySelectorAll(sel)];
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const state = { domains: [], detail: {}, scan: {}, chipFilter: null };
+
+/* ---------- scan intelligence ---------- */
+
+function derivedState(s) {
+  if (s.errors) return 'errors';
+  if (!s.zoneStatus) return 'unstarted';
+  if (s.pointedAtCf) return s.zoneStatus === 'active' ? 'done' : 'awaiting';
+  if (s.missing > 0) return 'needs-sync';
+  return 'ready';
+}
+
+function renderNotices() {
+  const scans = Object.values(state.scan);
+  const el = $('#notices');
+  if (!scans.length) { el.innerHTML = ''; return; }
+  const c = { ready: 0, 'needs-sync': 0, awaiting: 0, done: 0, unstarted: 0, errors: 0 };
+  let mail = 0, redir = 0;
+  scans.forEach((s) => {
+    c[derivedState(s)]++;
+    if (s.mailGaps > 0) mail++;
+    if (s.redirectsPending > 0) redir++;
+  });
+  const chip = (id, label, cls) => `<span class="chip ${cls}${state.chipFilter === id ? ' on' : ''}" data-chip="${id}">${label}</span>`;
+  el.innerHTML = [
+    c.ready ? chip('ready', `🟢 ${c.ready} ready to cut over`, 'good') : '',
+    c['needs-sync'] ? chip('needs-sync', `🔴 ${c['needs-sync']} need sync`, 'bad') : '',
+    c.awaiting ? chip('awaiting', `🕓 ${c.awaiting} awaiting activation`, 'warn') : '',
+    c.unstarted ? chip('unstarted', `⬜ ${c.unstarted} not started`, '') : '',
+    c.done ? chip('done', `✅ ${c.done} migrated`, 'good') : '',
+    mail ? chip('mail', `📮 ${mail} mail gaps`, 'warn') : '',
+    redir ? chip('redirects', `↪ ${redir} redirects pending`, 'warn') : '',
+    c.errors ? chip('errors', `⚠ ${c.errors} scan errors`, 'bad') : '',
+    state.chipFilter ? chip('clear', '✕ clear filter', '') : '',
+  ].join('');
+  $$('#notices .chip').forEach((ch) => {
+    ch.onclick = () => {
+      state.chipFilter = (ch.dataset.chip === 'clear' || state.chipFilter === ch.dataset.chip) ? null : ch.dataset.chip;
+      renderNotices();
+      renderDomains();
+    };
+  });
+}
+
+function scanBadges(domain) {
+  const s = state.scan[domain];
+  if (!s) return '';
+  const st = derivedState(s);
+  const total = s.same + s.missing;
+  const b = [];
+  if (st === 'errors') {
+    b.push('<span class="badge none">scan error</span>');
+  } else if (st === 'unstarted') {
+    b.push(`<span class="badge">${total} record${total === 1 ? '' : 's'} to sync</span>`);
+  } else if (s.missing) {
+    b.push(`<span class="badge none">✗ ${s.missing}/${total} missing</span>`);
+  } else if (total) {
+    b.push(`<span class="badge ready">✓ all ${total} records match</span>`);
+  }
+  if (s.extra) b.push(`<span class="badge">± ${s.extra} CF-only</span>`);
+  if (st === 'ready') b.push('<span class="badge ready">ready to cut over</span>');
+  if (st === 'awaiting') b.push('<span class="badge pending">awaiting activation</span>');
+  if (st === 'done') b.push('<span class="badge active">migrated</span>');
+  if (s.redirectsPending) b.push(`<span class="badge pending">↪ ${s.redirectsPending} redirect${s.redirectsPending > 1 ? 's' : ''}</span>`);
+  if (s.mailGaps) b.push(`<span class="badge mail">📮 ${esc(s.mailProvider)}: ${s.mailGaps} gap${s.mailGaps > 1 ? 's' : ''}</span>`);
+  else if (s.mailProvider && s.mailProvider !== 'Custom mail') b.push(`<span class="badge">${esc(s.mailProvider)} ✓</span>`);
+  return b.join(' ');
+}
+
+/** Distill a loaded detail panel into the same summary shape the batch scan produces. */
+function summaryFromDetail(d) {
+  return {
+    domain: d.domain,
+    missing: d.rows.filter((r) => r.status === 'enom-only').length,
+    extra: d.rows.filter((r) => r.status === 'cf-only').length,
+    same: d.rows.filter((r) => r.status === 'same').length,
+    zoneStatus: d.zone?.status ?? null,
+    pointedAtCf: d.pointedAtCf,
+    mailProvider: d.mail?.provider ?? null,
+    mailGaps: d.mail?.gaps || 0,
+    redirectsPending: (d.redirects || []).filter((r) => !r.covered).length,
+    errors: d.errors.length,
+  };
+}
+
+function toast(msg, cls = '') {
+  const el = document.createElement('div');
+  el.className = 'toastmsg ' + cls;
+  el.textContent = msg;
+  $('#toast').appendChild(el);
+  setTimeout(() => el.remove(), 6000);
+}
+
+async function api(path, opts = {}) {
+  const res = await fetch(path, opts.body
+    ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(opts.body) }
+    : {});
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || res.statusText);
+  return data;
+}
+
+/* ---------- settings ---------- */
+
+const CFG_KEYS = ['ENOM_UID', 'ENOM_PW', 'ENOM_ENV', 'CF_API_TOKEN', 'CF_ACCOUNT_ID'];
+
+async function loadSettings() {
+  const cfg = await api('/api/config');
+  for (const k of CFG_KEYS) {
+    const input = $('#cfg-' + k);
+    if (k === 'ENOM_ENV') input.value = cfg[k] || 'prod';
+    else input.placeholder = cfg[k] ? `current: ${cfg[k]}` : '(not set)';
+  }
+}
+
+$('#btn-settings').onclick = () => $('#settings').classList.toggle('open');
+
+$('#btn-save-cfg').onclick = async () => {
+  const body = {};
+  for (const k of CFG_KEYS) {
+    const v = $('#cfg-' + k).value;
+    if (k === 'ENOM_ENV') body[k] = v;
+    else if (v !== '') body[k] = v;
+  }
+  await api('/api/config', { body });
+  for (const k of CFG_KEYS) if (k !== 'ENOM_ENV') $('#cfg-' + k).value = '';
+  await loadSettings();
+  toast('Keys saved.', 'ok');
+};
+
+$('#btn-test-cfg').onclick = async () => {
+  $('#testline').textContent = 'Testing…';
+  const t = await api('/api/test', { body: {} });
+  $('#testline').innerHTML =
+    `Enom: <span style="color:var(--${t.enom.ok ? 'green' : 'red'})">${t.enom.ok ? '✓' : '✗'} ${esc(t.enom.message)}</span> · ` +
+    `Cloudflare: <span style="color:var(--${t.cloudflare.ok ? 'green' : 'red'})">${t.cloudflare.ok ? '✓' : '✗'} ${esc(t.cloudflare.message)}</span>`;
+};
+
+/* ---------- domain list ---------- */
+
+function zoneBadge(zoneStatus) {
+  if (zoneStatus === 'active') return '<span class="badge active">CF active</span>';
+  if (zoneStatus) return `<span class="badge pending">CF ${esc(zoneStatus)}</span>`;
+  return '<span class="badge none">no CF zone</span>';
+}
+
+function statusBucket(d) {
+  if (!d.zoneStatus) return 'none';
+  return d.zoneStatus === 'active' ? 'active' : 'pending';
+}
+// Work order: pending zones first (they count against CF's pending-zone cap), then unstarted, then done.
+const BUCKET_ORDER = { pending: 0, none: 1, active: 2 };
+
+function visibleDomains() {
+  const q = $('#search').value.trim().toLowerCase();
+  const status = $('#filter-status').value;
+  const sortBy = $('#sort-by').value;
+  let list = state.domains.filter((d) =>
+    (!q || d.domain.includes(q)) && (!status || statusBucket(d) === status));
+  if (state.chipFilter) {
+    list = list.filter((d) => {
+      const s = state.scan[d.domain];
+      if (!s) return false;
+      if (state.chipFilter === 'mail') return s.mailGaps > 0;
+      if (state.chipFilter === 'redirects') return s.redirectsPending > 0;
+      return derivedState(s) === state.chipFilter;
+    });
+  }
+  list = [...list].sort((a, b) => {
+    if (sortBy === 'status') {
+      const s = BUCKET_ORDER[statusBucket(a)] - BUCKET_ORDER[statusBucket(b)];
+      if (s !== 0) return s;
+    }
+    return a.domain.localeCompare(b.domain);
+  });
+  return list;
+}
+
+function renderDomains() {
+  const wrap = $('#domains');
+  if (!state.domains.length) { wrap.innerHTML = '<div class="loading">No domains (check Enom credentials in ⚙ API Keys).</div>'; return; }
+  const visible = visibleDomains();
+  const counts = { pending: 0, none: 0, active: 0 };
+  state.domains.forEach((d) => counts[statusBucket(d)]++);
+  wrap.innerHTML = visible.map((d) => `
+    <div class="domain" data-domain="${esc(d.domain)}">
+      <div class="domain-head">
+        <input type="checkbox" class="sel-domain" data-domain="${esc(d.domain)}" onclick="event.stopPropagation()">
+        <span class="name">${esc(d.domain)}</span>
+        ${zoneBadge(d.zoneStatus)}
+        <span class="scan-slot">${scanBadges(d.domain)}</span>
+        <span class="pointed-slot"></span>
+        <span class="spacer" style="flex:1"></span>
+        <span style="color:var(--dim);font-size:12px">click to open ▾</span>
+      </div>
+      <div class="detail"></div>
+    </div>`).join('');
+  $$('.domain-head').forEach((head) => { head.onclick = () => toggleDetail(head.parentElement); });
+  $$('.sel-domain').forEach((cb) => { cb.onchange = updateSelCount; });
+  $('#domain-count').textContent =
+    `${visible.length}/${state.domains.length} shown · ${counts.pending} pending · ${counts.none} no zone · ${counts.active} active`;
+  updateSelCount();
+}
+
+let scanning = false;
+async function runScan(domains) {
+  if (scanning || !domains.length) return;
+  scanning = true;
+  const btn = $('#btn-scan');
+  btn.disabled = true;
+  let done = 0;
+  try {
+    for (let i = 0; i < domains.length; i += 8) {
+      const chunk = domains.slice(i, i + 8);
+      const { results } = await api('/api/scan', { body: { domains: chunk } });
+      results.forEach((r) => { if (r && r.domain) state.scan[r.domain] = r; });
+      done += chunk.length;
+      btn.textContent = `🔍 Scanning ${done}/${domains.length}…`;
+      renderNotices();
+      renderDomains();
+    }
+    toast(`Scanned ${done} domain(s).`, 'ok');
+  } catch (err) { toast(err.message, 'err'); }
+  btn.textContent = '🔍 Scan visible';
+  btn.disabled = false;
+  scanning = false;
+}
+
+$('#btn-scan').onclick = () => runScan(visibleDomains().map((d) => d.domain));
+
+$('#search').oninput = renderDomains;
+$('#filter-status').onchange = renderDomains;
+$('#sort-by').onchange = renderDomains;
+
+async function refreshDomains() {
+  $('#domains').innerHTML = '<div class="loading">Loading domains…</div>';
+  try {
+    state.domains = await api('/api/domains');
+    renderDomains();
+  } catch (err) {
+    $('#domains').innerHTML = `<div class="errors">✗ ${esc(err.message)}</div>`;
+  }
+}
+$('#btn-refresh').onclick = refreshDomains;
+
+function updateSelCount() {
+  const n = $$('.sel-domain:checked').length;
+  $('#sel-count').textContent = `${n} selected`;
+  $('#btn-batch-sync').disabled = n === 0;
+}
+$('#sel-all-domains').onchange = (e) => {
+  $$('.sel-domain').forEach((cb) => { cb.checked = e.target.checked; });
+  updateSelCount();
+};
+
+$('#btn-batch-sync').onclick = async () => {
+  const domains = $$('.sel-domain:checked').map((cb) => cb.dataset.domain);
+  if (!domains.length) return;
+  if (!confirm(`Sync ALL missing records → Cloudflare for ${domains.length} domain(s)?\nZones will be created where needed. Nothing is deleted.`)) return;
+  toast(`Batch syncing ${domains.length} domain(s)…`);
+  try {
+    const { results } = await api('/api/batch/sync', { body: { domains, direction: 'to-cf' } });
+    for (const r of results) {
+      if (r.error) toast(`${r.domain}: ${r.error}`, 'err');
+      else toast(`${r.domain}: ${r.synced} synced${r.failed ? `, ${r.failed} failed` : ''}`, r.failed ? 'err' : 'ok');
+    }
+    await refreshDomains();
+  } catch (err) { toast(err.message, 'err'); }
+};
+
+/* ---------- detail panel ---------- */
+
+function recCell(rec) {
+  if (!rec) return '<td class="cell gap">—</td>';
+  const prio = rec.type === 'MX' ? ` <b>${rec.priority}</b>` : '';
+  return `<td class="cell cell-${rec._side}"><span class="rectype">${esc(rec.type)}</span> <span class="recname">${esc(rec.name)}</span> →${prio} <span class="reccontent">${esc(rec.content)}</span></td>`;
+}
+
+function renderDetail(card, d) {
+  const el = $('.detail', card);
+  const pointedSlot = $('.pointed-slot', card);
+  pointedSlot.innerHTML = d.pointedAtCf ? '<span class="badge pointed">NS → Cloudflare</span>' : '';
+
+  const counts = { same: 0, 'enom-only': 0, 'cf-only': 0 };
+  d.rows.forEach((r) => counts[r.status]++);
+
+  el.innerHTML = `
+    <div class="nsgrid">
+      <div class="nsbox ${d.pointedAtCf ? 'good' : ''}">
+        <h4>Enom · registrar NS</h4>
+        ${d.enomNs.map((n) => esc(n)).join('<br>') || '<span style="color:var(--dim)">(none)</span>'}
+      </div>
+      <div class="nsarrow">${d.pointedAtCf ? '✓' : '→'}</div>
+      <div class="nsbox">
+        <h4>Cloudflare · assigned NS ${d.zone ? `(zone ${esc(d.zone.status)})` : '(no zone)'}</h4>
+        ${d.cfNs.map((n) => esc(n)).join('<br>') || '<span style="color:var(--dim)">(zone not created yet)</span>'}
+      </div>
+    </div>
+    <div class="toolbar">
+      <button class="small primary act-sync-all-cf" ${counts['enom-only'] ? '' : 'disabled'}>Sync all → CF (${counts['enom-only']})</button>
+      <button class="small act-sync-sel" disabled>Sync selected</button>
+      <span class="sep"></span>
+      <button class="small danger act-cutover" ${d.zone && d.cfNs.length && !d.pointedAtCf ? '' : 'disabled'}>⚡ Cutover NS → Cloudflare</button>
+      <span class="sep"></span>
+      <label style="font-size:12px;color:var(--dim)"><input type="checkbox" class="epp-unlock" checked> unlock first</label>
+      <button class="small act-epp">✉ Email EPP key</button>
+      <span class="sep"></span>
+      ${d.rollback ? `
+        <span class="badge pointed" title="Saved ${esc(d.rollback.at)} — previous NS: ${esc(d.rollback.previousNs.join(', ') || '(none)')}${d.rollback.rolledBackAt ? ' · ROLLED BACK ' + esc(d.rollback.rolledBackAt) : ''}">↩ rollback saved</span>
+        <button class="small danger act-rollback" ${d.rollback.previousNs?.length ? '' : 'disabled'}>↩ Roll back NS</button>
+        <span class="sep"></span>` : ''}
+      <button class="small act-reload">↻</button>
+      <span style="color:var(--dim);font-size:12px">${counts.same} same · ${counts['enom-only']} missing in CF · ${counts['cf-only']} CF-only</span>
+    </div>
+    <table>
+      <thead><tr><th></th><th>Enom</th><th></th><th>Cloudflare</th><th></th></tr></thead>
+      <tbody>
+        ${d.rows.map((r) => {
+          const enom = r.enom ? { ...r.enom, _side: 'enom' } : null;
+          const cf = r.cf ? { ...r.cf, _side: 'cf' } : null;
+          const stat = r.status === 'same' ? '✓' : r.status === 'enom-only' ? '✗' : '±';
+          const act = r.status === 'enom-only'
+            ? `<button class="small act-row" data-key="${esc(r.key)}" data-dir="to-cf" title="Copy to Cloudflare">→</button>`
+            : r.status === 'cf-only'
+              ? `<button class="small act-row" data-key="${esc(r.key)}" data-dir="to-enom" title="Copy to Enom">←</button>`
+              : '';
+          const sel = r.status === 'same' ? '' : `<input type="checkbox" class="sel-row" data-key="${esc(r.key)}" data-dir="${r.status === 'enom-only' ? 'to-cf' : 'to-enom'}">`;
+          return `<tr class="${r.status}"><td class="sel">${sel}</td>${recCell(enom)}<td class="stat">${stat}</td>${recCell(cf)}<td class="act">${act}</td></tr>`;
+        }).join('')}
+      </tbody>
+    </table>
+    ${(d.redirects?.length || d.cfRedirects?.length) ? `
+    <h4 style="margin:14px 0 6px;font-size:12px;color:var(--dim);text-transform:uppercase;letter-spacing:.5px">Redirects · Enom URL records → Cloudflare redirect rules</h4>
+    <table>
+      <thead><tr><th>Enom</th><th></th><th>Cloudflare</th><th></th></tr></thead>
+      <tbody>
+        ${(d.redirects || []).map((r) => `
+          <tr class="${r.covered ? 'same' : 'enom-only'}">
+            <td class="cell cell-enom"><span class="rectype">${esc(r.enomType)}</span> <span class="recname">${esc(r.name)}</span> → <span class="reccontent">${esc(r.target)}</span></td>
+            <td class="stat">${r.covered ? '✓' : '✗'}</td>
+            <td class="cell ${r.covered ? '' : 'gap'}">${r.covered ? `rule: ${esc(r.name)} → ${esc(r.target)} (${r.status})` : '—'}</td>
+            <td class="act">${r.covered ? '' : `<button class="small act-redirect" data-name="${esc(r.name)}" data-target="${esc(r.target)}" data-status="${r.status}" title="Create rule + proxied DNS">→</button>`}</td>
+          </tr>`).join('')}
+        ${(d.cfRedirects || []).filter((c) => !(d.redirects || []).some((r) => c.expression?.includes('"' + r.name + '"') && c.target === r.target)).map((c) => `
+          <tr class="cf-only">
+            <td class="cell gap">—</td>
+            <td class="stat">±</td>
+            <td class="cell cell-cf"><span class="rectype">RULE</span> <span class="recname">${esc(c.expression)}</span> → <span class="reccontent">${esc(c.target)} (${c.status || '?'})</span></td>
+            <td class="act"></td>
+          </tr>`).join('')}
+      </tbody>
+    </table>` : ''}
+    ${d.mail?.provider ? `
+    <div class="mailbox">
+      <h4>Mail · ${esc(d.mail.provider)}${d.mail.gaps ? ` — ${d.mail.gaps} gap(s)` : ' — complete'}</h4>
+      ${d.mail.checks.map((c) => `
+        <div class="${c.ok ? 'mc-ok' : (c.required ? 'mc-gap' : 'mc-opt')}">${c.ok ? '✓' : '✗'} ${esc(c.label)}${!c.required ? ' <span style="color:var(--dim)">(optional)</span>' : ''}${!c.ok && !c.inEnom ? ' <span style="color:var(--dim)">— missing in Enom too (pre-existing gap)</span>' : ''}${!c.ok && c.inEnom ? ' <span style="color:var(--red)">— exists in Enom, not yet synced!</span>' : ''}</div>`).join('')}
+    </div>` : ''}
+    ${d.warnings.length ? `<div class="warnings">${d.warnings.map((w) => '! ' + esc(w)).join('<br>')}</div>` : ''}
+    ${d.errors.length ? `<div class="errors">${d.errors.map((e) => '✗ ' + esc(e)).join('<br>')}</div>` : ''}
+  `;
+
+  const domain = d.domain;
+  const reload = () => loadDetail(card, domain);
+
+  $$('.sel-row', el).forEach((cb) => {
+    cb.onchange = () => { $('.act-sync-sel', el).disabled = !$$('.sel-row:checked', el).length; };
+  });
+
+  $$('.act-row', el).forEach((btn) => {
+    btn.onclick = async () => {
+      btn.disabled = true;
+      try {
+        const { results } = await api(`/api/domain/sync?domain=${domain}`, { body: { direction: btn.dataset.dir, keys: [btn.dataset.key] } });
+        const bad = results.filter((r) => r.ok === false);
+        bad.length ? toast(bad.map((b) => b.message).join('; '), 'err') : toast('Record synced.', 'ok');
+        reload();
+      } catch (err) { toast(err.message, 'err'); btn.disabled = false; }
+    };
+  });
+
+  $('.act-sync-sel', el).onclick = async () => {
+    const sel = $$('.sel-row:checked', el);
+    const byDir = { 'to-cf': [], 'to-enom': [] };
+    sel.forEach((cb) => byDir[cb.dataset.dir].push(cb.dataset.key));
+    try {
+      for (const dir of ['to-cf', 'to-enom']) {
+        if (!byDir[dir].length) continue;
+        const { results } = await api(`/api/domain/sync?domain=${domain}`, { body: { direction: dir, keys: byDir[dir] } });
+        const bad = results.filter((r) => r.ok === false);
+        if (bad.length) toast(`${dir}: ${bad.map((b) => b.message).join('; ')}`, 'err');
+      }
+      toast('Selected records synced.', 'ok');
+      reload();
+    } catch (err) { toast(err.message, 'err'); }
+  };
+
+  $('.act-sync-all-cf', el).onclick = async () => {
+    try {
+      const { results } = await api(`/api/domain/sync?domain=${domain}`, { body: { direction: 'to-cf' } });
+      const bad = results.filter((r) => r.ok === false);
+      bad.length ? toast(`${bad.length} failed: ${bad[0].message}`, 'err') : toast(`Synced ${results.filter((r) => r.ok).length} record(s) → CF.`, 'ok');
+      reload();
+    } catch (err) { toast(err.message, 'err'); }
+  };
+
+  $('.act-cutover', el).onclick = async () => {
+    const missing = counts['enom-only'];
+    const msg = `Point ${domain} nameservers at Cloudflare?\n\nOld NS: ${d.enomNs.join(', ') || '(none)'}\nNew NS: ${d.cfNs.join(', ')}` +
+      (missing ? `\n\n⚠ ${missing} record(s) still missing in Cloudflare!` : '');
+    if (!confirm(msg)) return;
+    try {
+      const r = await api(`/api/domain/cutover?domain=${domain}`, { body: { force: missing > 0 } });
+      toast(`NS cut over. Rollback NS: ${r.previousNs.join(', ')}`, 'ok');
+      reload();
+    } catch (err) { toast(err.message, 'err'); }
+  };
+
+  $('.act-epp', el).onclick = async () => {
+    const unlock = $('.epp-unlock', el).checked;
+    if (!confirm(`${unlock ? 'Unlock ' + domain + ' and email' : 'Email'} the EPP/auth code to the registrant contact?`)) return;
+    try {
+      const { steps } = await api(`/api/domain/epp?domain=${domain}`, { body: { unlock } });
+      steps.forEach((s) => toast(`${s.step}: ${s.message}`, s.ok ? 'ok' : 'err'));
+    } catch (err) { toast(err.message, 'err'); }
+  };
+
+  const rollbackBtn = $('.act-rollback', el);
+  if (rollbackBtn) {
+    rollbackBtn.onclick = async () => {
+      if (!confirm(`Roll back ${domain} nameservers?\n\nRestores: ${d.rollback.previousNs.join(', ')}\n(currently: ${d.enomNs.join(', ')})`)) return;
+      try {
+        const r = await api(`/api/domain/rollback?domain=${domain}`, { body: {} });
+        toast(`NS rolled back to: ${r.restoredNs.join(', ')}`, 'ok');
+        reload();
+      } catch (err) { toast(err.message, 'err'); }
+    };
+  }
+
+  $$('.act-redirect', el).forEach((btn) => {
+    btn.onclick = async () => {
+      btn.disabled = true;
+      try {
+        const { steps } = await api(`/api/domain/redirect?domain=${domain}`, {
+          body: { name: btn.dataset.name, target: btn.dataset.target, status: Number(btn.dataset.status) },
+        });
+        steps.forEach((s) => toast(s.message, s.ok ? 'ok' : 'err'));
+        reload();
+      } catch (err) { toast(err.message, 'err'); btn.disabled = false; }
+    };
+  });
+
+  $('.act-reload', el).onclick = reload;
+}
+
+async function loadDetail(card, domain) {
+  const el = $('.detail', card);
+  el.classList.add('open');
+  el.innerHTML = '<div class="loading">Loading both zones…</div>';
+  try {
+    const d = await api(`/api/domain?domain=${domain}`);
+    state.detail[domain] = d;
+    renderDetail(card, d);
+    // Opening a domain refreshes its header pills in place — no full scan needed.
+    state.scan[domain] = summaryFromDetail(d);
+    const slot = $('.scan-slot', card);
+    if (slot) slot.innerHTML = scanBadges(domain);
+    renderNotices();
+  } catch (err) {
+    el.innerHTML = `<div class="errors">✗ ${esc(err.message)}</div>`;
+  }
+}
+
+function toggleDetail(card) {
+  const el = $('.detail', card);
+  const domain = card.dataset.domain;
+  if (el.classList.contains('open')) { el.classList.remove('open'); return; }
+  loadDetail(card, domain);
+}
+
+/* ---------- boot ---------- */
+(async () => {
+  await loadSettings().catch(() => {});
+  const cfg = await api('/api/config').catch(() => ({}));
+  const configured = cfg.ENOM_UID && cfg.CF_API_TOKEN;
+  if (!configured) $('#settings').classList.add('open');
+  await refreshDomains();
+  // Auto-populate pills after load; rows fill in progressively as chunks return.
+  if (configured && state.domains.length) runScan(state.domains.map((d) => d.domain));
+})();
+</script>
+</body>
+</html>
