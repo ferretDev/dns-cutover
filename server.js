@@ -11,7 +11,7 @@ import * as enom from './lib/enom.js';
 import * as cloudflare from './lib/cloudflare.js';
 import { loadConfig, saveConfig, maskedConfig } from './lib/config.js';
 import {
-  fromEnom, fromCloudflare, buildRows, toCloudflarePayload, toEnomHost, ENOM_WRITABLE,
+  fromEnom, fromEnomSrv, fromCloudflare, buildRows, toCloudflarePayload, toEnomHost, ENOM_WRITABLE,
 } from './lib/records.js';
 import { analyzeMail } from './lib/mailcheck.js';
 import { getRollbacks, saveRollback, markRolledBack } from './lib/rollback.js';
@@ -50,17 +50,22 @@ async function pooled(items, limit, fn) {
 
 /** Full state for one domain: both zones, NS, aligned rows. */
 async function domainState(domain) {
-  const [hostsR, nsR, zoneR] = await Promise.allSettled([
+  const [hostsR, srvR, nsR, zoneR] = await Promise.allSettled([
     enom.getHosts(domain),
+    enom.getSrvHosts(domain),
     enom.getNameservers(domain),
     cloudflare.getZone(domain),
   ]);
   const errors = [];
   const hosts = hostsR.status === 'fulfilled' ? hostsR.value : (errors.push(`Enom records: ${hostsR.reason.message}`), []);
+  const srvHosts = srvR.status === 'fulfilled' ? srvR.value : (errors.push(`Enom SRV records: ${srvR.reason.message}`), []);
   const enomNs = nsR.status === 'fulfilled' ? nsR.value : (errors.push(`Enom NS: ${nsR.reason.message}`), { nameservers: [] });
   const zone = zoneR.status === 'fulfilled' ? zoneR.value : (errors.push(`Cloudflare: ${zoneR.reason.message}`), null);
 
   const { records: enomRecords, warnings, redirects: enomRedirects } = fromEnom(hosts, domain);
+  const srv = fromEnomSrv(srvHosts, domain);
+  enomRecords.push(...srv.records);
+  warnings.push(...srv.warnings);
   let cfRecords = [];
   let cfRedirects = [];
   if (zone) {
