@@ -343,6 +343,9 @@ function visibleDomains() {
 function renderDomains() {
   const wrap = $('#domains');
   if (!state.domains.length) { wrap.innerHTML = '<div class="loading">No domains (check Enom credentials in ⚙ API Keys).</div>'; return; }
+  // Full re-render — preserve open accordions and checkbox selections across it.
+  const openSet = new Set($$('.detail.open', wrap).map((el) => el.closest('.domain').dataset.domain));
+  const checkedSet = new Set($$('.sel-domain:checked', wrap).map((cb) => cb.dataset.domain));
   const visible = visibleDomains();
   const counts = { pending: 0, none: 0, active: 0 };
   state.domains.forEach((d) => counts[statusBucket(d)]++);
@@ -360,7 +363,17 @@ function renderDomains() {
       <div class="detail"></div>
     </div>`).join('');
   $$('.domain-head').forEach((head) => { head.onclick = () => toggleDetail(head.parentElement); });
-  $$('.sel-domain').forEach((cb) => { cb.onchange = updateSelCount; });
+  $$('.sel-domain').forEach((cb) => {
+    cb.onchange = updateSelCount;
+    cb.checked = checkedSet.has(cb.dataset.domain);
+  });
+  $$('.domain', wrap).forEach((card) => {
+    if (!openSet.has(card.dataset.domain)) return;
+    const cached = state.detail[card.dataset.domain];
+    $('.detail', card).classList.add('open');
+    if (cached) renderDetail(card, cached);
+    else loadDetail(card, card.dataset.domain);
+  });
   $('#domain-count').textContent =
     `${visible.length}/${state.domains.length} shown · ${counts.pending} pending · ${counts.none} no zone · ${counts.active} active`;
   updateSelCount();
@@ -377,11 +390,16 @@ async function runScan(domains) {
     for (let i = 0; i < domains.length; i += 8) {
       const chunk = domains.slice(i, i + 8);
       const { results } = await api('/api/scan', { body: { domains: chunk } });
-      results.forEach((r) => { if (r && r.domain) state.scan[r.domain] = r; });
+      // Patch header pills in place — a full re-render would collapse open accordions.
+      results.forEach((r) => {
+        if (!r || !r.domain) return;
+        state.scan[r.domain] = r;
+        const card = document.querySelector(`.domain[data-domain="${CSS.escape(r.domain)}"]`);
+        if (card) $('.scan-slot', card).innerHTML = scanBadges(r.domain);
+      });
       done += chunk.length;
       btn.textContent = `🔍 Scanning ${done}/${domains.length}…`;
       renderNotices();
-      renderDomains();
     }
     toast(`Scanned ${done} domain(s).`, 'ok');
   } catch (err) { toast(err.message, 'err'); }
