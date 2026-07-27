@@ -80,6 +80,19 @@
   .warnings { margin-top: 10px; font-size: 12px; color: var(--amber); font-family: var(--mono); }
   .errors { margin-top: 10px; font-size: 12px; color: var(--red); font-family: var(--mono); }
 
+  /* dashboard */
+  #dash { display: flex; align-items: stretch; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+  .tile { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 8px 16px; cursor: pointer; min-width: 84px; text-align: center; }
+  .tile:hover { border-color: var(--dim); }
+  .tile.on { border-color: var(--blue); background: #1c2536; }
+  .tile .num { font-size: 20px; font-weight: 700; font-family: var(--mono); }
+  .tile .lbl { font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: .5px; }
+  .tile.t-ready .num { color: var(--green); }
+  .tile.t-missing .num { color: var(--red); }
+  .tile.t-pending .num { color: var(--amber); }
+  .tile.t-active .num { color: var(--green); }
+  #dash .tools { display: flex; flex-direction: column; gap: 6px; justify-content: center; margin-left: auto; }
+
   /* notices */
   #notices { display: flex; flex-wrap: wrap; gap: 8px; padding: 4px 0 8px; }
   .chip { font-size: 12px; padding: 3px 12px; border-radius: 12px; border: 1px solid var(--border); color: var(--text); cursor: pointer; user-select: none; background: var(--panel); }
@@ -132,6 +145,7 @@
     <div class="testline" id="testline"></div>
   </section>
 
+  <div id="dash"></div>
   <div id="notices"></div>
   <div id="batchbar">
     <input type="checkbox" id="sel-all-domains" title="Select all visible">
@@ -172,6 +186,80 @@ function derivedState(s) {
   if (s.pointedAtCf) return s.zoneStatus === 'active' ? 'done' : 'awaiting';
   if (s.missing > 0) return 'needs-sync';
   return 'ready';
+}
+
+function renderDash() {
+  const el = $('#dash');
+  if (!state.domains.length) { el.innerHTML = ''; return; }
+  const buckets = { none: 0, pending: 0, active: 0 };
+  state.domains.forEach((d) => buckets[statusBucket(d)]++);
+  const scans = Object.values(state.scan);
+  const ready = scans.filter((s) => derivedState(s) === 'ready').length;
+  const needSync = scans.filter((s) => derivedState(s) === 'needs-sync').length;
+  const scanned = scans.length > 0;
+  const zoneless = state.domains.filter((d) => !d.zoneStatus).map((d) => d.domain);
+  const selZoneless = $$('.sel-domain:checked').map((cb) => cb.dataset.domain).filter((d) => zoneless.includes(d));
+  const createTargets = selZoneless.length ? selZoneless : zoneless;
+
+  const tile = (id, num, lbl, cls = '', on = false) =>
+    `<div class="tile ${cls}${on ? ' on' : ''}" data-tile="${id}"><div class="num">${num}</div><div class="lbl">${lbl}</div></div>`;
+  el.innerHTML = [
+    tile('all', state.domains.length, 'domains', '', !state.chipFilter && !$('#filter-status').value),
+    tile('none', buckets.none, 'no zone', 't-missing', $('#filter-status').value === 'none'),
+    tile('pending', buckets.pending, 'pending', 't-pending', $('#filter-status').value === 'pending'),
+    tile('active', buckets.active, 'active', 't-active', $('#filter-status').value === 'active'),
+    tile('ready', scanned ? ready : '—', 'ready to cut', 't-ready', state.chipFilter === 'ready'),
+    tile('needs-sync', scanned ? needSync : '—', 'need sync', 't-missing', state.chipFilter === 'needs-sync'),
+    `<div class="tools">
+      <button class="small primary" id="btn-bulk-create" ${createTargets.length ? '' : 'disabled'}>⚡ Create &amp; sync ${selZoneless.length ? `selected (${selZoneless.length})` : `all zoneless (${zoneless.length})`}</button>
+      <button class="small danger" id="btn-bulk-cutover" ${ready ? '' : 'disabled'}>🚀 Cut over ready (${scanned ? ready : 0})</button>
+    </div>`,
+  ].join('');
+
+  $$('#dash .tile').forEach((t) => {
+    t.onclick = () => {
+      const id = t.dataset.tile;
+      state.chipFilter = null;
+      $('#filter-status').value = '';
+      if (id === 'none' || id === 'pending' || id === 'active') $('#filter-status').value = id;
+      else if (id === 'ready' || id === 'needs-sync') state.chipFilter = id;
+      renderNotices();
+      renderDomains();
+    };
+  });
+  $('#btn-bulk-create').onclick = () => bulkCreateSync(createTargets);
+  $('#btn-bulk-cutover').onclick = bulkCutover;
+}
+
+async function bulkCreateSync(targets) {
+  if (!targets.length) return;
+  if (!confirm(`Create Cloudflare zones (free plan) and sync ALL records for ${targets.length} domain(s)?\n\nHeads up: new zones sit in "pending" until NS cutover — Cloudflare caps pending zones, so do this in waves you can cut over the same day.`)) return;
+  toast(`Creating & syncing ${targets.length} domain(s)…`);
+  try {
+    const { results } = await api('/api/batch/sync', { body: { domains: targets, direction: 'to-cf' } });
+    for (const r of results) {
+      if (r.error) toast(`${r.domain}: ${r.error}`, 'err');
+      else toast(`${r.domain}: ${r.synced} synced${r.failed ? `, ${r.failed} failed` : ''}`, r.failed ? 'err' : 'ok');
+    }
+    await refreshDomains(true);
+    runScan(targets);
+  } catch (err) { toast(err.message, 'err'); }
+}
+
+async function bulkCutover() {
+  const targets = Object.values(state.scan).filter((s) => derivedState(s) === 'ready').map((s) => s.domain);
+  if (!targets.length) return;
+  const preview = targets.slice(0, 12).join('\n') + (targets.length > 12 ? `\n… +${targets.length - 12} more` : '');
+  if (!confirm(`Point ${targets.length} domain(s) at Cloudflare?\nAll have every record matched. Previous NS are snapshotted for rollback.\n\n${preview}`)) return;
+  let ok = 0;
+  for (const d of targets) {
+    try {
+      await api(`/api/domain/cutover?domain=${d}`, { body: {} });
+      ok++;
+      toast(`${d}: NS cut over (${ok}/${targets.length})`, 'ok');
+    } catch (err) { toast(`${d}: ${err.message}`, 'err'); }
+  }
+  runScan(targets);
 }
 
 function renderNotices() {
@@ -400,6 +488,7 @@ async function runScan(domains) {
       done += chunk.length;
       btn.textContent = `🔍 Scanning ${done}/${domains.length}…`;
       renderNotices();
+      renderDash();
     }
     toast(`Scanned ${done} domain(s).`, 'ok');
   } catch (err) { toast(err.message, 'err'); }
@@ -414,21 +503,23 @@ $('#search').oninput = renderDomains;
 $('#filter-status').onchange = renderDomains;
 $('#sort-by').onchange = renderDomains;
 
-async function refreshDomains() {
-  $('#domains').innerHTML = '<div class="loading">Loading domains…</div>';
+async function refreshDomains(soft = false) {
+  if (!soft) $('#domains').innerHTML = '<div class="loading">Loading domains…</div>';
   try {
     state.domains = await api('/api/domains');
     renderDomains();
+    renderDash();
   } catch (err) {
     $('#domains').innerHTML = `<div class="errors">✗ ${esc(err.message)}</div>`;
   }
 }
-$('#btn-refresh').onclick = refreshDomains;
+$('#btn-refresh').onclick = () => refreshDomains(true);
 
 function updateSelCount() {
   const n = $$('.sel-domain:checked').length;
   $('#sel-count').textContent = `${n} selected`;
   $('#btn-batch-sync').disabled = n === 0;
+  renderDash();
 }
 $('#sel-all-domains').onchange = (e) => {
   $$('.sel-domain').forEach((cb) => { cb.checked = e.target.checked; });
