@@ -534,11 +534,15 @@ function renderDetail(card, d) {
           </tr>`).join('')}
       </tbody>
     </table>` : ''}
-    ${d.mail?.provider ? `
+    ${(d.mail?.provider || d.mail?.misplacedDmarc) ? `
     <div class="mailbox">
-      <h4>Mail · ${esc(d.mail.provider)}${d.mail.gaps ? ` — ${d.mail.gaps} gap(s)` : ' — complete'}</h4>
-      ${d.mail.checks.map((c) => `
+      <h4>Mail${d.mail.provider ? ` · ${esc(d.mail.provider)}${d.mail.gaps ? ` — ${d.mail.gaps} gap(s)` : ' — complete'}` : ''}</h4>
+      ${(d.mail.checks || []).map((c) => `
         <div class="${c.ok ? 'mc-ok' : (c.required ? 'mc-gap' : 'mc-opt')}">${c.ok ? '✓' : '✗'} ${esc(c.label)}${!c.required ? ' <span style="color:var(--dim)">(optional)</span>' : ''}${!c.ok && !c.inEnom ? ' <span style="color:var(--dim)">— missing in Enom too (pre-existing gap)</span>' : ''}${!c.ok && c.inEnom ? ' <span style="color:var(--red)">— exists in Enom, not yet synced!</span>' : ''}</div>`).join('')}
+      ${d.mail.misplacedDmarc ? `
+        <div class="mc-gap" style="margin-top:6px">⚠ DMARC policy found at <b>dmarc.${esc(d.domain)}</b> — missing underscore, invisible to mail receivers.
+          <button class="small act-mirror-dmarc" style="margin-left:8px">🪞 Mirror to _dmarc</button>
+        </div>` : ''}
     </div>` : ''}
     ${d.warnings.length ? `<div class="warnings">${d.warnings.map((w) => '! ' + esc(w)).join('<br>')}</div>` : ''}
     ${d.errors.length ? `<div class="errors">${d.errors.map((e) => '✗ ' + esc(e)).join('<br>')}</div>` : ''}
@@ -618,6 +622,18 @@ function renderDetail(card, d) {
         toast(`Zone created (${r.plan}, ${r.status}). NS: ${r.nameServers.join(', ')}`, 'ok');
         reload();
       } catch (err) { toast(err.message, 'err'); createZoneBtn.disabled = false; }
+    };
+  }
+
+  const mirrorBtn = $('.act-mirror-dmarc', el);
+  if (mirrorBtn) {
+    mirrorBtn.onclick = async () => {
+      mirrorBtn.disabled = true;
+      try {
+        const r = await api(`/api/domain/mirror-dmarc?domain=${domain}`, { body: {} });
+        toast(r.message, 'ok');
+        reload();
+      } catch (err) { toast(err.message, 'err'); mirrorBtn.disabled = false; }
     };
   }
 

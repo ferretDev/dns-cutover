@@ -262,6 +262,23 @@ const routes = {
     return { steps, state: await domainState(domain) };
   },
 
+  'POST /api/domain/mirror-dmarc': async (req, res, domain) => {
+    const state = await domainState(domain);
+    if (!state.zone) throw new Error('No Cloudflare zone — sync first.');
+    const mis = state.mail?.misplacedDmarc;
+    if (!mis) throw new Error('No misplaced DMARC found (or _dmarc already exists).');
+    await cloudflare.createRecord(state.zone.id, toCloudflarePayload({
+      type: 'TXT',
+      name: `_dmarc.${domain}`,
+      content: mis.content,
+    }));
+    return {
+      ok: true,
+      message: `Created _dmarc.${domain} TXT mirroring dmarc.${domain} — DMARC is now actually deployed.`,
+      state: await domainState(domain),
+    };
+  },
+
   'POST /api/domain/epp': async (req, res, domain) => {
     const { unlock } = await readBody(req);
     const steps = [];
