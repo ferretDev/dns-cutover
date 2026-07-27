@@ -477,7 +477,7 @@ function renderDetail(card, d) {
         <h4>Cloudflare · assigned NS ${d.zone ? `(zone ${esc(d.zone.status)})` : '(no zone)'}</h4>
         ${d.zone
           ? (d.cfNs.map((n) => esc(n)).join('<br>') || '<span style="color:var(--dim)">(NS not assigned yet)</span>')
-          : '<button class="small primary act-create-zone">+ Create CF zone (free plan)</button>'}
+          : '<button class="small primary act-create-zone">+ Create CF zone & sync records</button>'}
       </div>
     </div>
     <div class="toolbar">
@@ -618,8 +618,15 @@ function renderDetail(card, d) {
     createZoneBtn.onclick = async () => {
       createZoneBtn.disabled = true;
       try {
-        const r = await api(`/api/domain/create-zone?domain=${domain}`, { body: {} });
-        toast(`Zone created (${r.plan}, ${r.status}). NS: ${r.nameServers.join(', ')}`, 'ok');
+        // Sync with no keys creates the zone (free plan) then pushes every missing record.
+        const { results } = await api(`/api/domain/sync?domain=${domain}`, { body: { direction: 'to-cf' } });
+        const zoneMsg = results.find((r) => r.key === '_zone');
+        if (zoneMsg) toast(zoneMsg.message, 'ok');
+        const bad = results.filter((r) => r.ok === false);
+        const created = results.filter((r) => r.ok && r.key !== '_zone').length;
+        bad.length
+          ? toast(`${created} record(s) synced, ${bad.length} failed: ${bad[0].message}`, 'err')
+          : toast(`${created} record(s) synced to the new zone.`, 'ok');
         reload();
       } catch (err) { toast(err.message, 'err'); createZoneBtn.disabled = false; }
     };
