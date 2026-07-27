@@ -197,6 +197,19 @@ const routes = {
 
   'GET /api/domain': async (req, res, domain) => domainState(domain),
 
+  'POST /api/domain/create-zone': async (req, res, domain) => {
+    const existing = await cloudflare.getZone(domain);
+    if (existing) throw new Error(`Zone already exists (status: ${existing.status}).`);
+    const zone = await cloudflare.createZone(domain);
+    return {
+      ok: true,
+      nameServers: zone.name_servers || [],
+      plan: zone.plan?.name || 'Free',
+      status: zone.status,
+      state: await domainState(domain),
+    };
+  },
+
   'POST /api/domain/sync': async (req, res, domain) => {
     const { direction = 'to-cf', keys } = await readBody(req);
     return { results: await syncRecords(domain, direction, keys), state: await domainState(domain) };

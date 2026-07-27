@@ -457,7 +457,9 @@ function renderDetail(card, d) {
       <div class="nsarrow">${d.pointedAtCf ? '✓' : '→'}</div>
       <div class="nsbox">
         <h4>Cloudflare · assigned NS ${d.zone ? `(zone ${esc(d.zone.status)})` : '(no zone)'}</h4>
-        ${d.cfNs.map((n) => esc(n)).join('<br>') || '<span style="color:var(--dim)">(zone not created yet)</span>'}
+        ${d.zone
+          ? (d.cfNs.map((n) => esc(n)).join('<br>') || '<span style="color:var(--dim)">(NS not assigned yet)</span>')
+          : '<button class="small primary act-create-zone">+ Create CF zone (free plan)</button>'}
       </div>
     </div>
     <div class="toolbar">
@@ -588,6 +590,18 @@ function renderDetail(card, d) {
       steps.forEach((s) => toast(`${s.step}: ${s.message}`, s.ok ? 'ok' : 'err'));
     } catch (err) { toast(err.message, 'err'); }
   };
+
+  const createZoneBtn = $('.act-create-zone', el);
+  if (createZoneBtn) {
+    createZoneBtn.onclick = async () => {
+      createZoneBtn.disabled = true;
+      try {
+        const r = await api(`/api/domain/create-zone?domain=${domain}`, { body: {} });
+        toast(`Zone created (${r.plan}, ${r.status}). NS: ${r.nameServers.join(', ')}`, 'ok');
+        reload();
+      } catch (err) { toast(err.message, 'err'); createZoneBtn.disabled = false; }
+    };
+  }
 
   const rollbackBtn = $('.act-rollback', el);
   if (rollbackBtn) {
