@@ -319,6 +319,63 @@ const routes = {
     return { results };
   },
 
+  /* ---- bulk corrective tools: operate across ALL Cloudflare zones ---- */
+
+  'POST /api/tools/find-proxied': async (req) => {
+    const { pattern } = await readBody(req);
+    if (!pattern || pattern.trim().length < 2) throw new Error('Pattern must be at least 2 characters.');
+    const p = pattern.trim().toLowerCase();
+    const zones = await cloudflare.listZones();
+    const found = [];
+    await pooled(zones, 6, async (z) => {
+      const recs = await cloudflare.listRecords(z.id);
+      for (const r of recs) {
+        if (r.proxied && r.name.toLowerCase().includes(p)) {
+          found.push({ domain: z.name, zoneId: z.id, recordId: r.id, type: r.type, name: r.name, content: r.content });
+        }
+      }
+    });
+    found.sort((a, b) => a.name.localeCompare(b.name));
+    return { found, zonesScanned: zones.length };
+  },
+
+  'POST /api/tools/unproxy': async (req) => {
+    const { items = [] } = await readBody(req);
+    const results = await pooled(items, 6, async (it) => {
+      await cloudflare.updateRecord(it.zoneId, it.recordId, { proxied: false });
+      return { name: it.name, ok: true };
+    });
+    return { results };
+  },
+
+  'POST /api/tools/find-misplaced-dmarc': async () => {
+    const zones = await cloudflare.listZones();
+    const found = [];
+    await pooled(zones, 6, async (z) => {
+      const recs = await cloudflare.listRecords(z.id);
+      const mis = recs.find((r) => r.type === 'TXT' && r.name.toLowerCase() === `dmarc.${z.name}` && /v=dmarc1/i.test(r.content));
+      const real = recs.some((r) => r.type === 'TXT' && r.name.toLowerCase() === `_dmarc.${z.name}`);
+      if (mis && !real) {
+        found.push({ domain: z.name, zoneId: z.id, content: mis.content.replace(/^"|"$/g, '') });
+      }
+    });
+    found.sort((a, b) => a.domain.localeCompare(b.domain));
+    return { found, zonesScanned: zones.length };
+  },
+
+  'POST /api/tools/mirror-dmarc-bulk': async (req) => {
+    const { items = [] } = await readBody(req);
+    const results = await pooled(items, 4, async (it) => {
+      await cloudflare.createRecord(it.zoneId, toCloudflarePayload({
+        type: 'TXT',
+        name: `_dmarc.${it.domain}`,
+        content: it.content,
+      }));
+      return { domain: it.domain, ok: true };
+    });
+    return { results };
+  },
+
   'POST /api/batch/sync': async (req) => {
     const { domains = [], direction = 'to-cf' } = await readBody(req);
     const results = await pooled(domains, 3, async (domain) => {

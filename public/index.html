@@ -125,6 +125,7 @@
   <h1>dns-cutover <span>· Enom → Cloudflare migration desk</span></h1>
   <div class="spacer"></div>
   <button id="btn-refresh">↻ Refresh domains</button>
+  <button id="btn-tools">🛠 Tools</button>
   <button id="btn-settings">⚙ API Keys</button>
 </header>
 
@@ -143,6 +144,22 @@
     <button id="btn-test-cfg">Test connections</button>
     <span style="color:var(--dim);font-size:12px;margin-left:8px">Stored locally in config.json (gitignored, chmod 600). Leave a field blank to keep the current value.</span>
     <div class="testline" id="testline"></div>
+  </section>
+
+  <section id="tools" style="display:none;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:16px;margin-bottom:16px">
+    <div style="margin-bottom:18px">
+      <b>Un-proxy records by pattern</b>
+      <div style="color:var(--dim);font-size:12px;margin:2px 0 8px">Finds proxied (orange-cloud) records whose name contains the pattern, across every Cloudflare zone, and flips them to DNS-only. Mail-infrastructure hostnames (pm-bounces, dkim, mail…) must not be proxied.</div>
+      <input id="unproxy-pattern" value="pm-bounces" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:5px 8px;font-family:var(--mono);font-size:12px;width:200px">
+      <button class="small" id="btn-find-proxied">Find</button>
+      <div id="unproxy-results" style="margin-top:8px"></div>
+    </div>
+    <div>
+      <b>Fix misplaced DMARCs fleet-wide</b>
+      <div style="color:var(--dim);font-size:12px;margin:2px 0 8px">Finds v=DMARC1 policies published at <code>dmarc.domain</code> (no underscore — invisible to mail receivers) where no <code>_dmarc.domain</code> exists, and mirrors them to the correct name. Originals are left untouched.</div>
+      <button class="small" id="btn-find-dmarc">Find misplaced DMARCs</button>
+      <div id="dmarc-results" style="margin-top:8px"></div>
+    </div>
   </section>
 
   <div id="dash"></div>
@@ -787,6 +804,78 @@ function toggleDetail(card) {
   if (el.classList.contains('open')) { el.classList.remove('open'); return; }
   loadDetail(card, domain);
 }
+
+/* ---------- bulk corrective tools ---------- */
+
+$('#btn-tools').onclick = () => {
+  const t = $('#tools');
+  t.style.display = t.style.display === 'none' ? 'block' : 'none';
+};
+
+function toolResultsTable(container, rows, cols, actionLabel, onApply) {
+  if (!rows.length) { container.innerHTML = '<span style="color:var(--dim);font-size:12px">Nothing found — all clean.</span>'; return; }
+  container.innerHTML = `
+    <table>
+      <thead><tr><th><input type="checkbox" class="t-all" checked></th>${cols.map((c) => `<th>${c.label}</th>`).join('')}</tr></thead>
+      <tbody>${rows.map((r, i) => `
+        <tr><td class="sel"><input type="checkbox" class="t-row" data-i="${i}" checked></td>
+        ${cols.map((c) => `<td style="font-family:var(--mono);font-size:12px;word-break:break-all">${esc(r[c.key])}</td>`).join('')}</tr>`).join('')}
+      </tbody>
+    </table>
+    <button class="small primary t-apply" style="margin-top:8px">${actionLabel} (${rows.length})</button>`;
+  const applyBtn = $('.t-apply', container);
+  const refreshCount = () => {
+    const n = $$('.t-row:checked', container).length;
+    applyBtn.textContent = `${actionLabel} (${n})`;
+    applyBtn.disabled = n === 0;
+  };
+  $('.t-all', container).onchange = (e) => { $$('.t-row', container).forEach((cb) => { cb.checked = e.target.checked; }); refreshCount(); };
+  $$('.t-row', container).forEach((cb) => { cb.onchange = refreshCount; });
+  applyBtn.onclick = async () => {
+    const selected = $$('.t-row:checked', container).map((cb) => rows[Number(cb.dataset.i)]);
+    applyBtn.disabled = true;
+    await onApply(selected, container);
+  };
+}
+
+$('#btn-find-proxied').onclick = async () => {
+  const pattern = $('#unproxy-pattern').value.trim();
+  const box = $('#unproxy-results');
+  box.innerHTML = '<span class="loading">Scanning all zones…</span>';
+  try {
+    const { found, zonesScanned } = await api('/api/tools/find-proxied', { body: { pattern } });
+    toast(`Scanned ${zonesScanned} zones — ${found.length} proxied record(s) matching "${pattern}".`);
+    toolResultsTable(box, found,
+      [{ key: 'name', label: 'Record' }, { key: 'type', label: 'Type' }, { key: 'content', label: 'Target' }],
+      '⬜ Un-proxy selected',
+      async (selected) => {
+        const { results } = await api('/api/tools/unproxy', { body: { items: selected } });
+        const bad = results.filter((r) => !r || r.error || r.ok === false);
+        bad.length ? toast(`${bad.length} failed: ${bad[0].error || bad[0].message}`, 'err')
+                   : toast(`${results.length} record(s) now DNS-only.`, 'ok');
+        $('#btn-find-proxied').click();
+      });
+  } catch (err) { box.innerHTML = `<div class="errors">✗ ${esc(err.message)}</div>`; }
+};
+
+$('#btn-find-dmarc').onclick = async () => {
+  const box = $('#dmarc-results');
+  box.innerHTML = '<span class="loading">Scanning all zones…</span>';
+  try {
+    const { found, zonesScanned } = await api('/api/tools/find-misplaced-dmarc', { body: {} });
+    toast(`Scanned ${zonesScanned} zones — ${found.length} misplaced DMARC(s).`);
+    toolResultsTable(box, found,
+      [{ key: 'domain', label: 'Domain' }, { key: 'content', label: 'Policy' }],
+      '🪞 Mirror selected to _dmarc',
+      async (selected) => {
+        const { results } = await api('/api/tools/mirror-dmarc-bulk', { body: { items: selected } });
+        const bad = results.filter((r) => !r || r.error || r.ok === false);
+        bad.length ? toast(`${bad.length} failed: ${bad[0].error || bad[0].message}`, 'err')
+                   : toast(`${results.length} _dmarc record(s) created.`, 'ok');
+        $('#btn-find-dmarc').click();
+      });
+  } catch (err) { box.innerHTML = `<div class="errors">✗ ${esc(err.message)}</div>`; }
+};
 
 /* ---------- boot ---------- */
 (async () => {
