@@ -155,6 +155,12 @@
       <div id="unproxy-results" style="margin-top:8px"></div>
     </div>
     <div style="margin-bottom:18px">
+      <b>Source-truth IP audit</b>
+      <div style="color:var(--dim);font-size:12px;margin:2px 0 8px">Pairs every A/AAAA record by name across Enom and Cloudflare and flags any whose IPs differ — the "cloned record got the wrong IP" detector. Note: for domains already cut over, Enom may be legitimately stale if you've since changed IPs in Cloudflare.</div>
+      <button class="small" id="btn-verify-ips">Verify IPs against source</button>
+      <div id="verifyip-results" style="margin-top:8px"></div>
+    </div>
+    <div style="margin-bottom:18px">
       <b>Shared-IP audit</b>
       <div style="color:var(--dim);font-size:12px;margin:2px 0 8px">Lists IPs used by A/AAAA records across multiple zones. Shared hosting is normal — but an IP appearing on a domain it shouldn't is how wrong-data clones show themselves. Informational; nothing is changed.</div>
       <button class="small" id="btn-shared-ips">Audit shared IPs</button>
@@ -999,6 +1005,26 @@ $('#btn-find-proxied').onclick = async () => {
                    : toast(`${results.length} record(s) now DNS-only.`, 'ok');
         $('#btn-find-proxied').click();
       });
+  } catch (err) { box.innerHTML = `<div class="errors">✗ ${esc(err.message)}</div>`; }
+};
+
+$('#btn-verify-ips').onclick = async () => {
+  const box = $('#verifyip-results');
+  box.innerHTML = '<span class="loading">Comparing every A/AAAA record against Enom source…</span>';
+  try {
+    const { mismatches, domainsChecked } = await api('/api/tools/verify-source-ips', { body: {} });
+    if (!mismatches.length) { box.innerHTML = `<span style="color:var(--green);font-size:12px">✓ Checked ${domainsChecked} domains — every paired A/AAAA record matches its Enom source.</span>`; return; }
+    box.innerHTML = `
+      <table>
+        <thead><tr><th>Domain</th><th>Record</th><th>Enom (source)</th><th>Cloudflare</th></tr></thead>
+        <tbody>${mismatches.map((m) => `
+          <tr><td style="font-family:var(--mono);font-size:12px">${esc(m.domain)}</td>
+          <td style="font-family:var(--mono);font-size:12px">${esc(m.record)}</td>
+          <td style="font-family:var(--mono);font-size:12px;color:var(--green)">${esc(m.enomIps)}</td>
+          <td style="font-family:var(--mono);font-size:12px;color:var(--red)">${esc(m.cfIps)}</td></tr>`).join('')}
+        </tbody>
+      </table>
+      <div style="color:var(--amber);font-size:12px;margin-top:6px">⚠ ${mismatches.length} record(s) drifted from source across ${domainsChecked} domains. Open each domain's diff to correct — or confirm the change was intentional post-migration.</div>`;
   } catch (err) { box.innerHTML = `<div class="errors">✗ ${esc(err.message)}</div>`; }
 };
 

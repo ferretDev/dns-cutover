@@ -535,6 +535,42 @@ const routes = {
     return { found, zonesScanned: zones.length };
   },
 
+  'POST /api/tools/verify-source-ips': async () => {
+    const [domains, zones] = await Promise.all([enom.listDomains(), cloudflare.listZones()]);
+    const zoneByName = new Map(zones.map((z) => [z.name.toLowerCase(), z]));
+    const targets = domains.filter((d) => zoneByName.has(d));
+    const mismatches = [];
+    await pooled(targets, 4, async (d) => {
+      const [hosts, cfRaw] = await Promise.all([
+        enom.getHosts(d),
+        cloudflare.listRecords(zoneByName.get(d).id),
+      ]);
+      const { records: enomRecs } = fromEnom(hosts, d);
+      const ipsByName = (recs) => {
+        const m = new Map();
+        for (const r of recs) {
+          if (r.type !== 'A' && r.type !== 'AAAA') continue;
+          if (r.content === '192.0.2.1') continue; // our redirect placeholders
+          const k = `${r.type} ${r.name.toLowerCase()}`;
+          if (!m.has(k)) m.set(k, new Set());
+          m.get(k).add(r.content);
+        }
+        return m;
+      };
+      const enomIps = ipsByName(enomRecs);
+      const cfIps = ipsByName(cfRaw.map((r) => ({ type: r.type, name: r.name, content: r.content })));
+      for (const [k, eSet] of enomIps) {
+        const cSet = cfIps.get(k);
+        if (!cSet) continue; // absent in CF = normal diff territory, not drift
+        const e = [...eSet].sort().join(', ');
+        const c = [...cSet].sort().join(', ');
+        if (e !== c) mismatches.push({ domain: d, record: k, enomIps: e, cfIps: c });
+      }
+    });
+    mismatches.sort((a, b) => a.domain.localeCompare(b.domain));
+    return { mismatches, domainsChecked: targets.length };
+  },
+
   'POST /api/tools/shared-ips': async () => {
     const zones = await cloudflare.listZones();
     const byIp = new Map();
