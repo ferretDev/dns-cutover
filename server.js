@@ -159,6 +159,125 @@ async function syncRecords(domain, direction, keys) {
   return results;
 }
 
+/* ---------- playbook: the full migration pipeline for one domain ---------- */
+
+// Hostnames that must never be proxied — pure-DNS mail infrastructure.
+const NOPROXY_PATTERNS = ['pm-bounces', '_domainkey', 'dkim'];
+
+async function runPlaybook(domain, { cutover = true } = {}) {
+  const steps = [];
+  const add = (step, status, detail = '') => steps.push({ step, status, detail });
+  let s;
+  try {
+    // 1. zone
+    s = await domainState(domain);
+    let zoneId = s.zone?.id;
+    if (zoneId) {
+      add('zone', 'skip', `exists (${s.zone.status})`);
+    } else {
+      const z = await cloudflare.createZone(domain);
+      zoneId = z.id;
+      add('zone', 'ok', `created — NS: ${(z.name_servers || []).join(', ')}`);
+    }
+
+    // 2. records
+    const missingBefore = s.rows.filter((r) => r.status === 'enom-only').length;
+    if (!missingBefore && s.zone) {
+      add('records', 'skip', 'nothing missing');
+    } else {
+      const results = await syncRecords(domain, 'to-cf', null);
+      const created = results.filter((r) => r.ok && r.key !== '_zone').length;
+      const failed = results.filter((r) => r.ok === false);
+      add('records', failed.length ? 'warn' : 'ok',
+        `${created} created${failed.length ? `, ${failed.length} FAILED (${failed[0].message})` : ''}`);
+    }
+
+    // refresh once for the fix steps
+    s = await domainState(domain);
+    zoneId = s.zone?.id;
+
+    // 3. redirects
+    const uncovered = (s.redirects || []).filter((r) => !r.covered);
+    if (!uncovered.length) {
+      add('redirects', 'skip', s.redirects?.length ? 'all covered' : 'none needed');
+    } else {
+      const raw = await cloudflare.listRecords(zoneId);
+      let made = 0;
+      const errs = [];
+      for (const r of uncovered) {
+        try {
+          const hostRecs = raw.filter((x) => x.name.toLowerCase() === r.name && ['A', 'AAAA', 'CNAME'].includes(x.type));
+          if (!hostRecs.length) {
+            await cloudflare.createRecord(zoneId, { type: 'A', name: r.name, content: '192.0.2.1', ttl: 1, proxied: true });
+          } else {
+            for (const x of hostRecs.filter((x) => !x.proxied)) await cloudflare.updateRecord(zoneId, x.id, { proxied: true });
+          }
+          await cloudflare.addRedirectRule(zoneId, { hostname: r.name, target: r.target, status: r.status });
+          made++;
+        } catch (e) { errs.push(`${r.name}: ${e.message}`); }
+      }
+      add('redirects', errs.length ? 'warn' : 'ok', `${made}/${uncovered.length} rules created${errs.length ? `; ${errs[0]}` : ''}`);
+    }
+
+    // 4. misplaced DMARC
+    if (s.mail?.misplacedDmarc) {
+      await cloudflare.createRecord(zoneId, toCloudflarePayload({
+        type: 'TXT', name: `_dmarc.${domain}`, content: s.mail.misplacedDmarc.content,
+      }));
+      add('dmarc', 'ok', 'mirrored dmarc → _dmarc');
+    } else {
+      add('dmarc', 'skip', 'no misplaced policy');
+    }
+
+    // 5. un-proxy mail hostnames
+    const rawRecs = await cloudflare.listRecords(zoneId);
+    const badProxy = rawRecs.filter((r) => r.proxied && NOPROXY_PATTERNS.some((p) => r.name.toLowerCase().includes(p)));
+    if (!badProxy.length) {
+      add('unproxy', 'skip', 'no proxied mail hostnames');
+    } else {
+      for (const r of badProxy) await cloudflare.updateRecord(zoneId, r.id, { proxied: false });
+      add('unproxy', 'ok', `${badProxy.length} flipped to DNS-only (${badProxy.map((b) => b.name).join(', ')})`);
+    }
+
+    // 6. verify
+    s = await domainState(domain);
+    const missing = s.rows.filter((r) => r.status === 'enom-only').length;
+    const matched = s.rows.filter((r) => r.status === 'same').length;
+    const cfCount = s.rows.filter((r) => r.cf).length;
+    const srvWarn = s.warnings.filter((w) => w.includes('SRV')).length;
+    let verified;
+    if (missing > 0) {
+      verified = false;
+      add('verify', 'fail', `${missing} record(s) still missing in Cloudflare`);
+    } else if (s.rows.length === 0) {
+      verified = false;
+      add('verify', 'fail', 'Enom has zero records and the CF zone is empty — source of truth unclear, cut over manually if intended');
+    } else if (matched === 0 && cfCount > 0) {
+      verified = true;
+      add('verify', 'warn', `Enom empty; CF zone has ${cfCount} manually-curated record(s)`);
+    } else {
+      verified = true;
+      add('verify', srvWarn ? 'warn' : 'ok', `all ${matched} records match${srvWarn ? ` (${srvWarn} broken SRV skipped — see warnings)` : ''}`);
+    }
+
+    // 7. cutover
+    if (!cutover) add('cutover', 'skip', 'disabled for this run');
+    else if (s.pointedAtCf) add('cutover', 'skip', 'already pointed at Cloudflare');
+    else if (!verified) add('cutover', 'blocked', 'verification failed');
+    else if (!s.cfNs.length) add('cutover', 'blocked', 'Cloudflare has not assigned nameservers yet');
+    else {
+      await enom.setNameservers(domain, s.cfNs);
+      saveRollback(domain, { previousNs: s.enomNs, newNs: s.cfNs, at: new Date().toISOString() });
+      add('cutover', 'ok', `NS → ${s.cfNs.join(', ')} (rollback saved)`);
+      s = await domainState(domain);
+    }
+  } catch (err) {
+    add('error', 'fail', err.message);
+    s = s || null;
+  }
+  return { domain, steps, state: s };
+}
+
 /* ---------- routes ---------- */
 
 const routes = {
@@ -196,6 +315,11 @@ const routes = {
   },
 
   'GET /api/domain': async (req, res, domain) => domainState(domain),
+
+  'POST /api/domain/playbook': async (req, res, domain) => {
+    const { cutover = true } = await readBody(req);
+    return runPlaybook(domain, { cutover });
+  },
 
   'POST /api/domain/create-zone': async (req, res, domain) => {
     const existing = await cloudflare.getZone(domain);

@@ -163,6 +163,7 @@
   </section>
 
   <div id="dash"></div>
+  <div id="pb-log" style="display:none;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:10px 14px;margin-bottom:12px;font-family:var(--mono);font-size:12px;max-height:320px;overflow-y:auto"></div>
   <div id="notices"></div>
   <div id="batchbar">
     <input type="checkbox" id="sel-all-domains" title="Select all visible">
@@ -193,7 +194,7 @@
 const $ = (sel, el = document) => el.querySelector(sel);
 const $$ = (sel, el = document) => [...el.querySelectorAll(sel)];
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
-const state = { domains: [], detail: {}, scan: {}, chipFilter: null };
+const state = { domains: [], detail: {}, scan: {}, chipFilter: null, pbCutover: true };
 
 /* ---------- scan intelligence ---------- */
 
@@ -230,6 +231,10 @@ function renderDash() {
     `<div class="tools">
       <button class="small primary" id="btn-bulk-create" ${createTargets.length ? '' : 'disabled'}>⚡ Create &amp; sync ${selZoneless.length ? `selected (${selZoneless.length})` : `all zoneless (${zoneless.length})`}</button>
       <button class="small danger" id="btn-bulk-cutover" ${ready ? '' : 'disabled'}>🚀 Cut over ready (${scanned ? ready : 0})</button>
+      <span style="display:flex;gap:6px;align-items:center">
+        <button class="small" id="btn-playbook" style="flex:1">▶ Playbook selected</button>
+        <label style="font-size:11px;color:var(--dim);white-space:nowrap"><input type="checkbox" id="pb-cutover" ${state.pbCutover ? 'checked' : ''}> cut over</label>
+      </span>
     </div>`,
   ].join('');
 
@@ -246,6 +251,52 @@ function renderDash() {
   });
   $('#btn-bulk-create').onclick = () => bulkCreateSync(createTargets);
   $('#btn-bulk-cutover').onclick = bulkCutover;
+  $('#btn-playbook').onclick = runPlaybookBulk;
+  $('#pb-cutover').onchange = (e) => { state.pbCutover = e.target.checked; };
+}
+
+/* ---------- playbook ---------- */
+
+const PB_ICONS = { ok: '<span style="color:var(--green)">✓</span>', skip: '<span style="color:var(--dim)">·</span>', warn: '<span style="color:var(--amber)">⚠</span>', fail: '<span style="color:var(--red)">✗</span>', blocked: '<span style="color:var(--red)">⛔</span>' };
+
+function pbLog(html) {
+  const el = $('#pb-log');
+  el.style.display = 'block';
+  el.insertAdjacentHTML('beforeend', html);
+  el.scrollTop = el.scrollHeight;
+}
+
+async function runPlaybookBulk() {
+  const targets = $$('.sel-domain:checked').map((cb) => cb.dataset.domain);
+  if (!targets.length) { toast('Select domains first (checkboxes), then run the playbook.', 'err'); return; }
+  const doCut = state.pbCutover;
+  if (!confirm(`Run playbook on ${targets.length} domain(s), one at a time?\n\nSteps: ensure zone → sync records → migrate redirects → fix misplaced DMARC → un-proxy mail hosts → verify${doCut ? ' → CUT OVER NS (verify-gated, rollback saved)' : ''}.`)) return;
+  $('#pb-log').innerHTML = '<button class="small" style="float:right" onclick="this.parentElement.style.display=\'none\'">✕</button>';
+  const btn = $('#btn-playbook');
+  btn.disabled = true;
+  let n = 0;
+  for (const d of targets) {
+    n++;
+    pbLog(`<div style="margin-top:8px"><b>▶ ${esc(d)}</b> <span style="color:var(--dim)">(${n}/${targets.length})</span></div>`);
+    try {
+      const r = await api(`/api/domain/playbook?domain=${d}`, { body: { cutover: doCut } });
+      for (const st of r.steps) {
+        pbLog(`<div style="padding-left:14px">${PB_ICONS[st.status] || st.status} <span style="color:var(--blue)">${esc(st.step)}</span> — ${esc(st.detail)}</div>`);
+      }
+      if (r.state) {
+        state.detail[d] = r.state;
+        state.scan[d] = summaryFromDetail(r.state);
+        const card = document.querySelector(`.domain[data-domain="${CSS.escape(d)}"]`);
+        if (card) $('.scan-slot', card).innerHTML = scanBadges(d);
+      }
+    } catch (err) {
+      pbLog(`<div style="padding-left:14px;color:var(--red)">✗ ${esc(err.message)}</div>`);
+    }
+    renderNotices();
+    renderDash();
+  }
+  pbLog('<div style="margin-top:8px;color:var(--green)">■ playbook run complete</div>');
+  btn.disabled = false;
 }
 
 async function bulkCreateSync(targets) {
