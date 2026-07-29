@@ -154,6 +154,12 @@
       <button class="small" id="btn-find-proxied">Find</button>
       <div id="unproxy-results" style="margin-top:8px"></div>
     </div>
+    <div style="margin-bottom:18px">
+      <b>Shared-IP audit</b>
+      <div style="color:var(--dim);font-size:12px;margin:2px 0 8px">Lists IPs used by A/AAAA records across multiple zones. Shared hosting is normal — but an IP appearing on a domain it shouldn't is how wrong-data clones show themselves. Informational; nothing is changed.</div>
+      <button class="small" id="btn-shared-ips">Audit shared IPs</button>
+      <div id="sharedip-results" style="margin-top:8px"></div>
+    </div>
     <div>
       <b>Fix misplaced DMARCs fleet-wide</b>
       <div style="color:var(--dim);font-size:12px;margin:2px 0 8px">Finds v=DMARC1 policies published at <code>dmarc.domain</code> (no underscore — invisible to mail receivers) where no <code>_dmarc.domain</code> exists, and mirrors them to the correct name. Originals are left untouched.</div>
@@ -194,7 +200,11 @@
 const $ = (sel, el = document) => el.querySelector(sel);
 const $$ = (sel, el = document) => [...el.querySelectorAll(sel)];
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
-const state = { domains: [], detail: {}, scan: {}, chipFilter: null, pbCutover: true };
+const state = {
+  domains: [], detail: {}, scan: {}, chipFilter: null, pbCutover: true,
+  pbMax: Number(localStorage.getItem('pbMax') || 20),
+  queueRunning: false,
+};
 
 /* ---------- scan intelligence ---------- */
 
@@ -235,6 +245,13 @@ function renderDash() {
         <button class="small" id="btn-playbook" style="flex:1">▶ Playbook selected</button>
         <label style="font-size:11px;color:var(--dim);white-space:nowrap"><input type="checkbox" id="pb-cutover" ${state.pbCutover ? 'checked' : ''}> cut over</label>
       </span>
+      <span style="display:flex;gap:6px;align-items:center">
+        ${state.queueRunning
+          ? '<button class="small danger" id="btn-queue" style="flex:1">■ Stop queue</button>'
+          : '<button class="small" id="btn-queue" style="flex:1">🎛 Queue selected</button>'}
+        <input type="range" id="pb-max" min="1" max="50" value="${state.pbMax}" style="width:64px" ${state.queueRunning ? 'disabled' : ''}>
+        <span style="font-size:11px;color:var(--dim);white-space:nowrap" id="pb-max-lbl">≤${state.pbMax} pending</span>
+      </span>
     </div>`,
   ].join('');
 
@@ -253,6 +270,19 @@ function renderDash() {
   $('#btn-bulk-cutover').onclick = bulkCutover;
   $('#btn-playbook').onclick = runPlaybookBulk;
   $('#pb-cutover').onchange = (e) => { state.pbCutover = e.target.checked; };
+  $('#btn-queue').onclick = () => {
+    if (state.queueRunning) {
+      state.queueRunning = false;
+      toast('Queue stopping after the current domain…');
+    } else {
+      runQueuePlaybook();
+    }
+  };
+  $('#pb-max').oninput = (e) => {
+    state.pbMax = Number(e.target.value);
+    localStorage.setItem('pbMax', state.pbMax);
+    $('#pb-max-lbl').textContent = `≤${state.pbMax} pending`;
+  };
 }
 
 /* ---------- playbook ---------- */
@@ -266,6 +296,28 @@ function pbLog(html) {
   el.scrollTop = el.scrollHeight;
 }
 
+async function playbookOne(d, doCut, label = '') {
+  pbLog(`<div style="margin-top:8px"><b>▶ ${esc(d)}</b> <span style="color:var(--dim)">${label}</span></div>`);
+  try {
+    const r = await api(`/api/domain/playbook?domain=${d}`, { body: { cutover: doCut } });
+    for (const st of r.steps) {
+      pbLog(`<div style="padding-left:14px">${PB_ICONS[st.status] || st.status} <span style="color:var(--blue)">${esc(st.step)}</span> — ${esc(st.detail)}</div>`);
+    }
+    if (r.state) {
+      state.detail[d] = r.state;
+      state.scan[d] = summaryFromDetail(r.state);
+      const card = document.querySelector(`.domain[data-domain="${CSS.escape(d)}"]`);
+      if (card) $('.scan-slot', card).innerHTML = scanBadges(d);
+    }
+    renderNotices();
+    renderDash();
+    return r;
+  } catch (err) {
+    pbLog(`<div style="padding-left:14px;color:var(--red)">✗ ${esc(err.message)}</div>`);
+    return null;
+  }
+}
+
 async function runPlaybookBulk() {
   const targets = $$('.sel-domain:checked').map((cb) => cb.dataset.domain);
   if (!targets.length) { toast('Select domains first (checkboxes), then run the playbook.', 'err'); return; }
@@ -277,26 +329,65 @@ async function runPlaybookBulk() {
   let n = 0;
   for (const d of targets) {
     n++;
-    pbLog(`<div style="margin-top:8px"><b>▶ ${esc(d)}</b> <span style="color:var(--dim)">(${n}/${targets.length})</span></div>`);
-    try {
-      const r = await api(`/api/domain/playbook?domain=${d}`, { body: { cutover: doCut } });
-      for (const st of r.steps) {
-        pbLog(`<div style="padding-left:14px">${PB_ICONS[st.status] || st.status} <span style="color:var(--blue)">${esc(st.step)}</span> — ${esc(st.detail)}</div>`);
-      }
-      if (r.state) {
-        state.detail[d] = r.state;
-        state.scan[d] = summaryFromDetail(r.state);
-        const card = document.querySelector(`.domain[data-domain="${CSS.escape(d)}"]`);
-        if (card) $('.scan-slot', card).innerHTML = scanBadges(d);
-      }
-    } catch (err) {
-      pbLog(`<div style="padding-left:14px;color:var(--red)">✗ ${esc(err.message)}</div>`);
-    }
-    renderNotices();
-    renderDash();
+    await playbookOne(d, doCut, `(${n}/${targets.length})`);
   }
   pbLog('<div style="margin-top:8px;color:var(--green)">■ playbook run complete</div>');
   btn.disabled = false;
+}
+
+/* ---------- windowed queue: respect Cloudflare's pending-zone cap ---------- */
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function qSleep(ms) {
+  const end = Date.now() + ms;
+  while (Date.now() < end && state.queueRunning) await sleep(Math.min(5000, end - Date.now()));
+}
+
+async function runQueuePlaybook() {
+  const targets = $$('.sel-domain:checked').map((cb) => cb.dataset.domain);
+  if (!targets.length) { toast('Select domains to queue first (checkboxes).', 'err'); return; }
+  if (!confirm(`Queue ${targets.length} domain(s) through the full playbook, keeping at most ${state.pbMax} zones awaiting NS activation?\n\nDomains are admitted only while account-wide pending zones < ${state.pbMax} — the window auto-shrinks if anything else is pending. As zones activate, the queue advances. Cutover is ON (activation requires it). Keep this tab open.`)) return;
+  state.queueRunning = true;
+  renderDash();
+  $('#pb-log').innerHTML = '<button class="small" style="float:right" onclick="this.parentElement.style.display=\'none\'">✕</button>';
+  const queue = [...targets];
+  let processed = 0;
+  pbLog(`<div><b>🎛 Queue started</b> — ${queue.length} domain(s), window ≤${state.pbMax} pending</div>`);
+  while (queue.length && state.queueRunning) {
+    let pending;
+    try {
+      ({ pending } = await api('/api/pending-status'));
+    } catch (err) {
+      pbLog(`<div style="color:var(--red)">✗ pending check failed: ${esc(err.message)} — retrying in 1 min</div>`);
+      await qSleep(60_000);
+      continue;
+    }
+    const slots = Math.max(0, state.pbMax - pending);
+    if (!slots) {
+      pbLog(`<div style="color:var(--amber)">window full (${pending} pending account-wide) — nudging CF activation checks, re-checking in 3 min…</div>`);
+      api('/api/activation-check', { body: {} }).catch(() => {});
+      await qSleep(180_000);
+      continue;
+    }
+    const batch = queue.splice(0, slots);
+    pbLog(`<div style="margin-top:6px;color:var(--blue)">admitting ${batch.length} — pending ${pending}/${state.pbMax}, ${queue.length} left in queue</div>`);
+    for (const d of batch) {
+      if (!state.queueRunning) { queue.unshift(d); break; }
+      processed++;
+      await playbookOne(d, true, `(queue ${processed}/${targets.length})`);
+    }
+    if (queue.length && state.queueRunning) {
+      pbLog('<div style="color:var(--dim)">waiting for activations to free window slots (3 min)…</div>');
+      api('/api/activation-check', { body: {} }).catch(() => {});
+      await qSleep(180_000);
+    }
+  }
+  pbLog(state.queueRunning
+    ? `<div style="margin-top:8px;color:var(--green)">■ queue complete — ${processed} processed; remaining pendings will activate on their own</div>`
+    : `<div style="margin-top:8px;color:var(--amber)">■ queue stopped (${processed} processed, ${queue.length} not started — reselect and re-queue any time, the playbook is idempotent)</div>`);
+  state.queueRunning = false;
+  renderDash();
+  refreshDomains(true);
 }
 
 async function bulkCreateSync(targets) {
@@ -702,6 +793,8 @@ function renderDetail(card, d) {
         <div class="mc-gap" style="margin-top:6px">⚠ DMARC policy found at <b>dmarc.${esc(d.domain)}</b> — missing underscore, invisible to mail receivers.
           <button class="small act-mirror-dmarc" style="margin-left:8px">🪞 Mirror to _dmarc</button>
         </div>` : ''}
+      ${(d.mail.contamination || []).map((c) => `
+        <div class="mc-gap" style="margin-top:6px">🧬 ${esc(c.msg)}${c.inEnom ? ' <span style="color:var(--dim)">(pre-existing in Enom — source-data problem)</span>' : ' <span style="color:var(--red)">(Cloudflare only — bad clone, fix before cutover!)</span>'}</div>`).join('')}
     </div>` : ''}
     ${d.warnings.length ? `<div class="warnings">${d.warnings.map((w) => '! ' + esc(w)).join('<br>')}</div>` : ''}
     ${d.errors.length ? `<div class="errors">${d.errors.map((e) => '✗ ' + esc(e)).join('<br>')}</div>` : ''}
@@ -906,6 +999,25 @@ $('#btn-find-proxied').onclick = async () => {
                    : toast(`${results.length} record(s) now DNS-only.`, 'ok');
         $('#btn-find-proxied').click();
       });
+  } catch (err) { box.innerHTML = `<div class="errors">✗ ${esc(err.message)}</div>`; }
+};
+
+$('#btn-shared-ips').onclick = async () => {
+  const box = $('#sharedip-results');
+  box.innerHTML = '<span class="loading">Scanning all zones…</span>';
+  try {
+    const { shared, zonesScanned } = await api('/api/tools/shared-ips', { body: {} });
+    if (!shared.length) { box.innerHTML = `<span style="color:var(--dim);font-size:12px">Scanned ${zonesScanned} zones — no IPs shared between domains.</span>`; return; }
+    box.innerHTML = `
+      <table>
+        <thead><tr><th>IP</th><th>Zones</th><th>Domains sharing it</th></tr></thead>
+        <tbody>${shared.map((s) => `
+          <tr><td style="font-family:var(--mono);font-size:12px">${esc(s.ip)}</td>
+          <td style="font-family:var(--mono);font-size:12px">${s.domainCount}</td>
+          <td style="font-family:var(--mono);font-size:12px;word-break:break-all">${s.domains.map(esc).join(', ')}</td></tr>`).join('')}
+        </tbody>
+      </table>
+      <div style="color:var(--dim);font-size:12px;margin-top:6px">Scanned ${zonesScanned} zones. Eyeball for domains that shouldn't share infrastructure.</div>`;
   } catch (err) { box.innerHTML = `<div class="errors">✗ ${esc(err.message)}</div>`; }
 };
 

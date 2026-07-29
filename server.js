@@ -48,6 +48,23 @@ async function pooled(items, limit, fn) {
   return results;
 }
 
+/**
+ * Identity guards — every write is checked against the domain it claims to
+ * belong to, so stale or cross-domain data can never land in the wrong zone.
+ */
+function assertBelongs(name, domain) {
+  const n = (name || '').toLowerCase();
+  if (n !== domain && !n.endsWith(`.${domain}`)) {
+    throw new Error(`identity guard: record "${name}" does not belong to ${domain} — write refused`);
+  }
+}
+function assertZone(zone, domain) {
+  if (zone && zone.name && zone.name.toLowerCase() !== domain) {
+    throw new Error(`identity guard: Cloudflare returned zone "${zone.name}" for ${domain} — aborting`);
+  }
+  return zone;
+}
+
 /** Full state for one domain: both zones, NS, aligned rows. */
 async function domainState(domain) {
   const [hostsR, srvR, nsR, zoneR] = await Promise.allSettled([
@@ -60,7 +77,7 @@ async function domainState(domain) {
   const hosts = hostsR.status === 'fulfilled' ? hostsR.value : (errors.push(`Enom records: ${hostsR.reason.message}`), []);
   const srvHosts = srvR.status === 'fulfilled' ? srvR.value : (errors.push(`Enom SRV records: ${srvR.reason.message}`), []);
   const enomNs = nsR.status === 'fulfilled' ? nsR.value : (errors.push(`Enom NS: ${nsR.reason.message}`), { nameservers: [] });
-  const zone = zoneR.status === 'fulfilled' ? zoneR.value : (errors.push(`Cloudflare: ${zoneR.reason.message}`), null);
+  const zone = zoneR.status === 'fulfilled' ? assertZone(zoneR.value, domain) : (errors.push(`Cloudflare: ${zoneR.reason.message}`), null);
 
   const { records: enomRecords, warnings, redirects: enomRedirects } = fromEnom(hosts, domain);
   const srv = fromEnomSrv(srvHosts, domain);
@@ -123,13 +140,14 @@ async function syncRecords(domain, direction, keys) {
   if (direction === 'to-cf') {
     let zone = state.zone;
     if (!zone) {
-      const created = await cloudflare.createZone(domain);
+      const created = assertZone(await cloudflare.createZone(domain), domain);
       zone = { id: created.id, status: created.status };
       results.push({ key: '_zone', ok: true, message: `Created Cloudflare zone (NS: ${(created.name_servers || []).join(', ')})` });
     }
     const targets = state.rows.filter((r) => r.status === 'enom-only' && (all || wanted.has(r.key)));
     for (const row of targets) {
       try {
+        assertBelongs(row.enom.name, domain);
         await cloudflare.createRecord(zone.id, toCloudflarePayload(row.enom));
         results.push({ key: row.key, ok: true });
       } catch (err) {
@@ -144,6 +162,7 @@ async function syncRecords(domain, direction, keys) {
     }
     if (writable.length) {
       // SetHosts replaces the whole zone — resubmit current hosts + additions in one call.
+      writable.forEach((r) => assertBelongs(r.cf.name, domain));
       const current = await enom.getHosts(domain);
       const additions = writable.map((r) => toEnomHost(r.cf, domain));
       try {
@@ -175,7 +194,7 @@ async function runPlaybook(domain, { cutover = true } = {}) {
     if (zoneId) {
       add('zone', 'skip', `exists (${s.zone.status})`);
     } else {
-      const z = await cloudflare.createZone(domain);
+      const z = assertZone(await cloudflare.createZone(domain), domain);
       zoneId = z.id;
       add('zone', 'ok', `created — NS: ${(z.name_servers || []).join(', ')}`);
     }
@@ -259,6 +278,14 @@ async function runPlaybook(domain, { cutover = true } = {}) {
       verified = true;
       add('verify', srvWarn ? 'warn' : 'ok', `all ${matched} records match${srvWarn ? ` (${srvWarn} broken SRV skipped — see warnings)` : ''}`);
     }
+    for (const c of s.mail?.contamination || []) {
+      if (c.inEnom) {
+        add('verify', 'warn', `pre-existing at source: ${c.msg}`);
+      } else {
+        verified = false;
+        add('verify', 'fail', `cross-domain data in Cloudflare only: ${c.msg}`);
+      }
+    }
 
     // 7. cutover
     if (!cutover) add('cutover', 'skip', 'disabled for this run');
@@ -316,6 +343,26 @@ const routes = {
 
   'GET /api/domain': async (req, res, domain) => domainState(domain),
 
+  'GET /api/pending-status': async () => {
+    const zones = await cloudflare.listZones();
+    const pendingZones = zones.filter((z) => z.status !== 'active');
+    return { pending: pendingZones.length, names: pendingZones.map((z) => z.name) };
+  },
+
+  'POST /api/activation-check': async () => {
+    const zones = await cloudflare.listZones();
+    const pending = zones.filter((z) => z.status !== 'active');
+    const results = await pooled(pending, 4, async (z) => {
+      try {
+        await cloudflare.activationCheck(z.id);
+        return { name: z.name, ok: true };
+      } catch (e) {
+        return { name: z.name, ok: false, message: e.message }; // rate-limited checks are fine to skip
+      }
+    });
+    return { checked: results.filter((r) => r?.ok).length, pending: pending.length };
+  },
+
   'POST /api/domain/playbook': async (req, res, domain) => {
     const { cutover = true } = await readBody(req);
     return runPlaybook(domain, { cutover });
@@ -364,7 +411,8 @@ const routes = {
   'POST /api/domain/redirect': async (req, res, domain) => {
     const { name, target, status = 301 } = await readBody(req);
     if (!name || !target) throw new Error('name and target are required');
-    const zone = await cloudflare.getZone(domain);
+    assertBelongs(name, domain);
+    const zone = assertZone(await cloudflare.getZone(domain), domain);
     if (!zone) throw new Error('No Cloudflare zone — sync first.');
     const steps = [];
 
@@ -485,6 +533,29 @@ const routes = {
     });
     found.sort((a, b) => a.domain.localeCompare(b.domain));
     return { found, zonesScanned: zones.length };
+  },
+
+  'POST /api/tools/shared-ips': async () => {
+    const zones = await cloudflare.listZones();
+    const byIp = new Map();
+    await pooled(zones, 6, async (z) => {
+      const recs = await cloudflare.listRecords(z.id);
+      for (const r of recs) {
+        if (r.type !== 'A' && r.type !== 'AAAA') continue;
+        if (r.content === '192.0.2.1') continue; // our redirect placeholders
+        if (!byIp.has(r.content)) byIp.set(r.content, new Map());
+        byIp.get(r.content).set(z.name, [...(byIp.get(r.content).get(z.name) || []), r.name]);
+      }
+    });
+    const shared = [...byIp.entries()]
+      .filter(([, domains]) => domains.size >= 2)
+      .map(([ip, domains]) => ({
+        ip,
+        domainCount: domains.size,
+        domains: [...domains.keys()].sort(),
+      }))
+      .sort((a, b) => b.domainCount - a.domainCount);
+    return { shared, zonesScanned: zones.length };
   },
 
   'POST /api/tools/mirror-dmarc-bulk': async (req) => {
