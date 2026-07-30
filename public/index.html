@@ -1023,16 +1023,20 @@ function renderDetail(card, d) {
       box.innerHTML = '<div class="loading">Probing every hostname in the zone…</div>';
       try {
         const { results } = await api(`/api/domain/probe-hosts?domain=${domain}`, { body: {} });
+        const issues = results.filter((r) => r.class !== 'live').length;
         box.innerHTML = `
-          <table style="margin-bottom:10px">
-            <thead><tr><th>Host</th><th>State</th><th>ms</th><th>Detail</th></tr></thead>
-            <tbody>${results.map((r) => `
-              <tr><td style="font-family:var(--mono);font-size:12px">${esc(r.host)}</td>
-              <td style="font-family:var(--mono);font-size:12px;color:${HEALTH_COLORS[r.class] || 'var(--text)'}">${esc(r.class)}${r.status ? ' ' + r.status : ''}</td>
-              <td style="font-family:var(--mono);font-size:12px">${r.ms ?? ''}</td>
-              <td style="font-family:var(--mono);font-size:12px;word-break:break-all">${esc(r.detail || '')}</td></tr>`).join('')}
-            </tbody>
-          </table>`;
+          <details ${issues ? 'open' : ''} style="margin-top:10px;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:6px 12px">
+            <summary style="cursor:pointer;font-family:var(--mono);font-size:12px">🔦 Hostname probe — ${issues ? `<span style="color:var(--red)">${issues} issue${issues > 1 ? 's' : ''}</span>` : '<span style="color:var(--green)">all live</span>'} <span style="color:var(--dim)">(${results.length} host${results.length === 1 ? '' : 's'})</span></summary>
+            <table style="margin:6px 0 4px">
+              <thead><tr><th>Host</th><th>State</th><th>ms</th><th>Detail</th></tr></thead>
+              <tbody>${results.map((r) => `
+                <tr><td style="font-family:var(--mono);font-size:12px">${esc(r.host)}</td>
+                <td style="font-family:var(--mono);font-size:12px;color:${HEALTH_COLORS[r.class] || 'var(--text)'}">${esc(r.class)}${r.status ? ' ' + r.status : ''}</td>
+                <td style="font-family:var(--mono);font-size:12px">${r.ms ?? ''}</td>
+                <td style="font-family:var(--mono);font-size:12px;word-break:break-all">${esc(r.detail || '')}</td></tr>`).join('')}
+              </tbody>
+            </table>
+          </details>`;
       } catch (err) { box.innerHTML = `<div class="errors">✗ ${esc(err.message)}</div>`; }
       probeHostsBtn.disabled = false;
     };
