@@ -208,6 +208,7 @@
     <button class="small" id="btn-diag">🩺 Diagnose visible</button>
     <button class="small" id="btn-report" title="Markdown report for selected (or visible) domains from current scan/probe/diagnostic data">📄 Report</button>
     <button class="small" id="btn-email-report" title="Email the same report via Postmark (configure in ⚙ API Keys)">✉</button>
+    <button class="small" id="btn-triage" title="Problems-only report: every flag (uptime, sync, mail, redirects, diagnostics) grouped by failure class with recommended actions">🚑 Triage</button>
     <span class="spacer"></span>
     <input id="search" placeholder="filter…" style="background:var(--panel);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:4px 8px;font-family:var(--mono);font-size:12px;width:160px">
     <select id="filter-status" style="background:var(--panel);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:4px 6px;font-size:12px">
@@ -1359,6 +1360,58 @@ $('#btn-email-report').onclick = () => {
   if (!targets.length) { toast('Nothing to report on.', 'err'); return; }
   const { md, date } = composeBulkMd(targets);
   emailMd(`DNS migration report — ${targets.length} domain(s) — ${date}`, md);
+};
+
+/** Triage: problems only, grouped by failure class, with recommended actions. */
+const TRIAGE_CLASSES = {
+  'no-dns': ['name does not resolve — no apex record, or NS moved away', 'Run Tools → "Missing @ / www" for mirror fixes, or confirm the domain is mail-only/parked.'],
+  'tls-error': ['origin certificate invalid', 'Proxy the record (orange-cloud) so Cloudflare serves the edge cert, or install a valid certificate on the origin.'],
+  'origin-error': ['Cloudflare 52x — origin refuses or is misconfigured for this hostname', 'Add the vhost/server block + certificate on the origin (same fix as istalliance.com).'],
+  dead: ['nothing answers at all', 'Check the origin service and network path.'],
+  'server-error': ['5xx from the application', 'Check application/origin logs.'],
+  'client-error': ['4xx response', 'Verify this is expected (auth wall, removed content).'],
+};
+
+function composeTriageMd() {
+  const now = new Date();
+  const date = now.toISOString().slice(0, 10);
+  const L = [`# DNS triage report — ${date}`, ''];
+  const downs = Object.entries(state.health).filter(([, h]) => UP_BAD(h.class));
+  L.push(`${downs.length} uptime flag(s) across ${Object.keys(state.health).length} probed domain(s)${state.lastProbe ? ` (last probe ${state.lastProbe})` : ''}`, '');
+  for (const cls of Object.keys(TRIAGE_CLASSES)) {
+    const group = downs.filter(([, h]) => h.class === cls).sort((a, b) => a[0].localeCompare(b[0]));
+    if (!group.length) continue;
+    const [desc, action] = TRIAGE_CLASSES[cls];
+    L.push(`## ${cls} (${group.length}) — ${desc}`, `**Action:** ${action}`, '');
+    group.forEach(([d, h]) => L.push(`- ${d}${h.status ? ` (${h.status})` : ''}${h.detail ? ` — ${h.detail}` : ''}`));
+    L.push('');
+  }
+  const scanIssues = [];
+  for (const [d, s] of Object.entries(state.scan)) {
+    if (s.errors) { scanIssues.push(`- ${d} — scan error`); continue; }
+    const bits = [];
+    if (s.missing) bits.push(`${s.missing} record(s) missing in Cloudflare`);
+    if (s.mailGaps) bits.push(`${s.mailProvider}: ${s.mailGaps} mail gap(s)`);
+    if (s.redirectsPending) bits.push(`${s.redirectsPending} redirect(s) not migrated`);
+    if (bits.length) scanIssues.push(`- ${d} — ${bits.join(' · ')}`);
+  }
+  if (scanIssues.length) L.push(`## Sync / mail / redirect issues (${scanIssues.length})`, '**Action:** open the domain in the desk — sync buttons and mail fixers are one click.', '', ...scanIssues.sort(), '');
+  const diagIssues = [];
+  for (const [d, dg] of Object.entries(state.diag)) {
+    const fails = (dg.checks || []).filter((c) => c.status === 'fail');
+    if (fails.length) diagIssues.push(`- ${d} — ${fails.map((c) => c.label + (c.detail ? ` (${c.detail})` : '')).join('; ')}`);
+  }
+  if (diagIssues.length) L.push(`## Diagnostic failures (${diagIssues.length})`, '**Action:** site-level problems — noindex, parked pages, redirect loops. Fix at origin or in Cloudflare rules.', '', ...diagIssues.sort(), '');
+  if (!downs.length && !scanIssues.length && !diagIssues.length) L.push('All clear — nothing flagged by uptime, scans, or diagnostics.');
+  return { md: `${L.join('\n')}\n`, date };
+}
+
+$('#btn-triage').onclick = () => {
+  if (!Object.keys(state.health).length && !Object.keys(state.scan).length) { toast('Nothing scanned or probed yet — run an up-check or Scan first.', 'err'); return; }
+  const { md, date } = composeTriageMd();
+  downloadText(`dns-triage-${date}.md`, md);
+  toast('Triage report downloaded.', 'ok');
+  if (state.emailReady && confirm('Email the triage report too?')) emailMd(`DNS triage report — ${date}`, md);
 };
 
 /** Auto-email after playbook/queue runs: report for the targets + the run log. */
