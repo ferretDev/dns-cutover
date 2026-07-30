@@ -203,6 +203,7 @@
     <button class="small primary" id="btn-batch-sync">Batch sync selected → Cloudflare</button>
     <button class="small" id="btn-scan">🔍 Scan visible</button>
     <button class="small" id="btn-diag">🩺 Diagnose visible</button>
+    <button class="small" id="btn-report" title="Markdown report for selected (or visible) domains from current scan/probe/diagnostic data">📄 Report</button>
     <span class="spacer"></span>
     <input id="search" placeholder="filter…" style="background:var(--panel);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:4px 8px;font-family:var(--mono);font-size:12px;width:160px">
     <select id="filter-status" style="background:var(--panel);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:4px 6px;font-size:12px">
@@ -241,7 +242,7 @@ const state = {
   domains: [], detail: {}, scan: {}, chipFilter: null,
   health: {}, lastProbe: '',
   autoProbe: localStorage.getItem('autoProbe') !== 'off',
-  diag: {},
+  diag: {}, hostprobe: {},
   pbMax: Number(localStorage.getItem('pbMax') || 20),
   queueRunning: false,
   playbooks: {},
@@ -835,6 +836,7 @@ function renderDetail(card, d) {
         <span class="sep"></span>` : ''}
       <button class="small act-probe-hosts" ${d.zone ? '' : 'disabled'} title="Probe every hostname in this zone">🔦 probe hosts</button>
       <button class="small act-diag" ${d.zone ? '' : 'disabled'} title="Deep site diagnostic (redirects, headers, indexability, content sanity)">🩺 diagnose</button>
+      <button class="small act-report" title="Download a Markdown report for this domain">📄</button>
       <button class="small act-reload">↻</button>
       <span style="color:var(--dim);font-size:12px">${counts.same} same · ${counts['enom-only']} missing in CF · ${counts['cf-only']} CF-only</span>
     </div>
@@ -1023,6 +1025,7 @@ function renderDetail(card, d) {
       box.innerHTML = '<div class="loading">Probing every hostname in the zone…</div>';
       try {
         const { results } = await api(`/api/domain/probe-hosts?domain=${domain}`, { body: {} });
+        state.hostprobe[domain] = results;
         const issues = results.filter((r) => r.class !== 'live').length;
         box.innerHTML = `
           <details ${issues ? 'open' : ''} style="margin-top:10px;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:6px 12px">
@@ -1060,6 +1063,12 @@ function renderDetail(card, d) {
       diagBtn.disabled = false;
     };
   }
+
+  $('.act-report', el).onclick = () => {
+    const date = new Date().toISOString().slice(0, 10);
+    downloadText(`report-${domain}-${date}.md`, `# ${domain} — DNS report ${date}\n\n${mdForDomain(domain)}\n`);
+    toast(`Report downloaded for ${domain}.`, 'ok');
+  };
 
   $('.act-reload', el).onclick = reload;
 }
@@ -1217,6 +1226,90 @@ $('#btn-find-proxied').onclick = async () => {
       });
   } catch (err) { box.innerHTML = `<div class="errors">✗ ${esc(err.message)}</div>`; }
 };
+
+/* ---------- report generation (composed from current dashboard knowledge) ---------- */
+
+function downloadText(filename, text) {
+  const blob = new Blob([text], { type: 'text/markdown' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+function mdForDomain(domain) {
+  const det = state.detail[domain];
+  const s = state.scan[domain];
+  const h = state.health[domain];
+  const dg = state.diag[domain];
+  const hp = state.hostprobe[domain];
+  const L = [`## ${domain}`];
+  if (det) {
+    L.push(`- Zone: ${det.zone ? det.zone.status : 'not created'}${det.pointedAtCf ? ' · NS pointed at Cloudflare ✓' : ''}`);
+    const counts = { same: 0, 'enom-only': 0, 'cf-only': 0 };
+    det.rows.forEach((r) => counts[r.status]++);
+    L.push(`- Records: ${counts.same} matched · ${counts['enom-only']} missing in Cloudflare · ${counts['cf-only']} Cloudflare-only`);
+    L.push(`- Nameservers: Enom [${det.enomNs.join(', ') || 'none'}] · Cloudflare [${det.cfNs.join(', ') || '—'}]`);
+    if (det.rollback) L.push(`- Rollback snapshot: previous NS ${det.rollback.previousNs.join(', ')} (saved ${det.rollback.at})`);
+    if (det.mail?.provider) {
+      L.push(`- Mail (${det.mail.provider}): ${det.mail.gaps ? `${det.mail.gaps} gap(s)` : 'complete'}`);
+      det.mail.checks.filter((c) => !c.ok && c.required).forEach((c) =>
+        L.push(`  - ✗ ${c.label}${c.inEnom ? ' (exists in Enom, not yet synced)' : ' (missing at source too — pre-existing)'}`));
+      (det.mail.contamination || []).forEach((c) => L.push(`  - 🧬 ${c.msg}`));
+    }
+    if (det.redirects?.length) L.push(`- Redirects: ${det.redirects.filter((r) => r.covered).length}/${det.redirects.length} migrated to Cloudflare rules`);
+    (det.warnings || []).forEach((w) => L.push(`- ⚠ ${w}`));
+  } else if (s) {
+    L.push(`- Zone: ${s.zoneStatus || 'not created'}${s.pointedAtCf ? ' · NS pointed at Cloudflare ✓' : ''}`);
+    L.push(`- Records: ${s.same} matched · ${s.missing} missing · ${s.extra} Cloudflare-only`);
+    if (s.mailProvider) L.push(`- Mail (${s.mailProvider}): ${s.mailGaps ? `${s.mailGaps} gap(s)` : 'complete'}`);
+    if (s.redirectsPending) L.push(`- Redirects pending: ${s.redirectsPending}`);
+  } else {
+    L.push('- (not scanned this session)');
+  }
+  if (h) L.push(`- Uptime: ${h.class}${h.status ? ` ${h.status}` : ''}${h.ms ? ` (${h.ms}ms)` : ''}${h.detail ? ` — ${h.detail}` : ''}`);
+  if (hp) {
+    const issues = hp.filter((r) => r.class !== 'live');
+    L.push(`- Hostname probe (${hp.length} hosts): ${issues.length ? `${issues.length} issue(s)` : 'all live'}`);
+    issues.forEach((r) => L.push(`  - ✗ ${r.host}: ${r.class}${r.status ? ` ${r.status}` : ''}${r.detail ? ` — ${r.detail}` : ''}`));
+  }
+  if (dg) {
+    L.push(`- Diagnostics: ${dg.fails ? `${dg.fails} fail` : 'clean'}${dg.warns ? ` · ${dg.warns} warn` : ''}`);
+    dg.checks.filter((c) => c.status === 'fail' || c.status === 'warn').forEach((c) =>
+      L.push(`  - ${c.status === 'fail' ? '✗' : '⚠'} ${c.label}${c.detail ? ` — ${c.detail}` : ''}`));
+  }
+  return L.join('\n');
+}
+
+function bulkReport() {
+  const sel = $$('.sel-domain:checked').map((cb) => cb.dataset.domain);
+  const targets = sel.length ? sel : visibleDomains().map((d) => d.domain);
+  if (!targets.length) { toast('Nothing to report on.', 'err'); return; }
+  const now = new Date();
+  const date = now.toISOString().slice(0, 10);
+  const buckets = { none: 0, pending: 0, active: 0 };
+  state.domains.filter((d) => targets.includes(d.domain)).forEach((d) => buckets[statusBucket(d)]++);
+  const scans = targets.map((d) => state.scan[d]).filter(Boolean);
+  const healths = targets.map((d) => state.health[d]).filter(Boolean);
+  const head = [
+    `# DNS Migration Report — ${date}`,
+    '',
+    `Generated by dns-cutover at ${now.toISOString()} · ${targets.length} domain(s)`,
+    '',
+    '## Fleet summary',
+    `- Zones: ${buckets.active} active · ${buckets.pending} pending · ${buckets.none} not created`,
+    scans.length ? `- Records: ${scans.filter((s) => s.missing === 0 && s.zoneStatus).length} fully synced · ${scans.filter((s) => s.missing > 0).length} with missing records` : '- Records: (run Scan for record status)',
+    scans.length ? `- NS cut over: ${scans.filter((s) => s.pointedAtCf).length}/${targets.length}` : '',
+    healths.length ? `- Uptime (last probe ${state.lastProbe}): ${healths.filter((h) => h.class === 'live').length} up · ${healths.filter((h) => UP_BAD(h.class)).length} down` : '- Uptime: (run an up-check for live status)',
+    scans.filter((s) => s.mailGaps > 0).length ? `- Mail gaps: ${scans.filter((s) => s.mailGaps > 0).length} domain(s)` : '',
+    '',
+  ].filter((l) => l !== '');
+  const body = targets.map(mdForDomain).join('\n\n');
+  downloadText(`dns-report-${date}.md`, `${head.join('\n')}\n${body}\n`);
+  toast(`Report generated for ${targets.length} domain(s).`, 'ok');
+}
+$('#btn-report').onclick = bulkReport;
 
 /* ---------- diagnostic sweeper ---------- */
 
