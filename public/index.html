@@ -18,7 +18,7 @@
   header h1 { font-size: 16px; margin: 0; }
   header h1 span { color: var(--dim); font-weight: 400; }
   .spacer { flex: 1; }
-  button { background: #21262d; color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 5px 12px; cursor: pointer; font-size: 13px; }
+  button { background: #21262d; color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 5px 12px; cursor: pointer; font-size: 13px; white-space: nowrap; }
   button:hover { border-color: var(--dim); }
   button:disabled { opacity: .45; cursor: default; }
   button.primary { background: #238636; border-color: #2ea043; }
@@ -35,7 +35,12 @@
   .testline { font-family: var(--mono); font-size: 12px; margin-top: 8px; }
 
   /* batch bar */
-  #batchbar { display: flex; align-items: center; gap: 10px; padding: 8px 0; font-size: 13px; color: var(--dim); }
+  #batchbar, #filterbar { display: flex; align-items: center; gap: 8px; padding: 5px 0; font-size: 13px; color: var(--dim); flex-wrap: wrap; }
+  .vsep { width: 1px; height: 18px; background: var(--border); flex: none; }
+  #dash .tools { width: 300px; }
+  #dash .tools > button, #dash .tools > span > button:first-child { width: 100%; }
+  #dash .tools .trow { display: flex; gap: 6px; align-items: center; }
+  #dash .tools select { flex: 1; min-width: 0; }
 
   /* domain list */
   .domain { border: 1px solid var(--border); border-radius: 8px; margin-bottom: 8px; background: var(--panel); overflow: hidden; }
@@ -211,14 +216,26 @@
   <div id="batchbar">
     <input type="checkbox" id="sel-all-domains" title="Select all visible">
     <span id="sel-count">0 selected</span>
-    <button class="small primary" id="btn-batch-sync">Batch sync selected → Cloudflare</button>
-    <button class="small" id="btn-scan">🔍 Scan visible</button>
-    <button class="small" id="btn-diag">🩺 Diagnose visible</button>
+    <button class="small primary" id="btn-batch-sync" title="Sync all missing records to Cloudflare for the selected domains">⇄ Sync selected → CF</button>
+    <span class="vsep"></span>
+    <button class="small" id="btn-scan" title="Diff every visible domain against Enom">🔍 Scan</button>
+    <button class="small" id="btn-diag" title="Deep site diagnostics for visible active zones">🩺 Diagnose</button>
+    <span class="vsep"></span>
     <button class="small" id="btn-report" title="Markdown report for selected (or visible) domains from current scan/probe/diagnostic data">📄 Report</button>
     <button class="small" id="btn-email-report" title="Email the same report via Postmark (configure in ⚙ API Keys)">✉</button>
-    <button class="small" id="btn-triage" title="Problems-only report: every flag (uptime, sync, mail, redirects, diagnostics) grouped by failure class with recommended actions">🚑 Triage</button>
-    <span class="spacer"></span>
-    <input id="search" placeholder="filter…" style="background:var(--panel);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:4px 8px;font-family:var(--mono);font-size:12px;width:160px">
+    <button class="small" id="btn-triage" title="Problems-only report: every flag grouped by failure class with recommended actions">🚑 Triage</button>
+    <span class="vsep"></span>
+    <label style="font-size:12px;color:var(--dim);white-space:nowrap" title="Probe a domain's hostnames automatically when its accordion opens"><input type="checkbox" id="autoprobe-toggle"> auto-probe</label>
+    <span style="color:var(--dim);font-size:12px">⏱</span>
+    <select id="up-interval" title="Uptime scan interval" style="background:var(--panel);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:4px 6px;font-size:12px">
+      <option value="0">up-check: off</option>
+      <option value="60">every 1 min</option>
+      <option value="300">every 5 min</option>
+      <option value="900">every 15 min</option>
+    </select>
+  </div>
+  <div id="filterbar">
+    <input id="search" placeholder="filter domains…" style="background:var(--panel);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:4px 8px;font-family:var(--mono);font-size:12px;width:180px">
     <select id="filter-status" style="background:var(--panel);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:4px 6px;font-size:12px">
       <option value="">all statuses</option>
       <option value="pending">pending (work these first)</option>
@@ -229,18 +246,14 @@
       <option value="status">sort: status (pending first)</option>
       <option value="name">sort: name</option>
     </select>
-    <label style="font-size:12px;color:var(--dim);white-space:nowrap" title="Probe a domain's hostnames automatically when its accordion opens"><input type="checkbox" id="autoprobe-toggle"> auto-probe on open</label>
-    <span style="color:var(--dim);font-size:12px">⏱</span>
-    <select id="up-interval" title="Uptime scan interval" style="background:var(--panel);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:4px 6px;font-size:12px">
-      <option value="0">up-check: off</option>
-      <option value="60">every 1 min</option>
-      <option value="300">every 5 min</option>
-      <option value="900">every 15 min</option>
-    </select>
+    <span class="spacer"></span>
     <span id="up-summary"></span>
-    <span id="domain-count"></span>
+    <span id="domain-count" style="font-size:12px"></span>
   </div>
-  <div id="downs" style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px"></div>
+  <details id="downs-wrap" style="display:none;margin-bottom:8px">
+    <summary id="downs-sum" style="cursor:pointer;font-size:12px;color:var(--red)"></summary>
+    <div id="downs" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:6px"></div>
+  </details>
 
   <div id="domains"><div class="loading">Loading domains…</div></div>
 </main>
@@ -311,19 +324,21 @@ function renderDash() {
     `<div class="tools">
       <button class="small primary" id="btn-bulk-create" ${createTargets.length ? '' : 'disabled'}>⚡ Create &amp; sync ${selZoneless.length ? `selected (${selZoneless.length})` : `all zoneless (${zoneless.length})`}</button>
       <button class="small danger" id="btn-bulk-cutover" ${ready ? '' : 'disabled'}>🚀 Cut over ready (${scanned ? ready : 0})</button>
-      <select id="pb-select" title="Which playbook runs" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:4px 6px;font-size:12px">
-        ${Object.keys(state.playbooks).map((n) => `<option ${n === state.pbSelected ? 'selected' : ''}>${esc(n)}</option>`).join('') || '<option>Full migration</option>'}
-      </select>
-      <span style="display:flex;gap:6px;align-items:center">
-        <button class="small" id="btn-playbook" style="flex:1">▶ Run playbook on selected</button>
+      <span class="trow">
+        <select id="pb-select" title="Which playbook runs" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:4px 6px;font-size:12px">
+          ${Object.keys(state.playbooks).map((n) => `<option ${n === state.pbSelected ? 'selected' : ''}>${esc(n)}</option>`).join('') || '<option>Full migration</option>'}
+        </select>
         <label style="font-size:11px;color:var(--dim);white-space:nowrap" title="Email report + run log via Postmark when a playbook or queue run finishes"><input type="checkbox" id="pb-email" ${state.pbEmail ? 'checked' : ''}> ✉ on finish</label>
       </span>
-      <span style="display:flex;gap:6px;align-items:center">
+      <span class="trow">
+        <button class="small" id="btn-playbook" style="flex:1">▶ Run on selected</button>
         ${state.queueRunning
           ? '<button class="small danger" id="btn-queue" style="flex:1">■ Stop queue</button>'
-          : '<button class="small" id="btn-queue" style="flex:1">🎛 Queue selected</button>'}
-        <input type="range" id="pb-max" min="1" max="50" value="${state.pbMax}" style="width:64px" ${state.queueRunning ? 'disabled' : ''}>
-        <span style="font-size:11px;color:var(--dim);white-space:nowrap" id="pb-max-lbl">≤${state.pbMax} pending</span>
+          : '<button class="small" id="btn-queue" style="flex:1">🎛 Queue</button>'}
+      </span>
+      <span class="trow" style="justify-content:flex-end">
+        <input type="range" id="pb-max" min="1" max="50" value="${state.pbMax}" style="width:110px" ${state.queueRunning ? 'disabled' : ''}>
+        <span style="font-size:11px;color:var(--dim);white-space:nowrap" id="pb-max-lbl">queue window ≤${state.pbMax} pending</span>
       </span>
     </div>`,
   ].join('');
@@ -362,7 +377,7 @@ function renderDash() {
   $('#pb-max').oninput = (e) => {
     state.pbMax = Number(e.target.value);
     localStorage.setItem('pbMax', state.pbMax);
-    $('#pb-max-lbl').textContent = `≤${state.pbMax} pending`;
+    $('#pb-max-lbl').textContent = `queue window ≤${state.pbMax} pending`;
   };
 }
 
@@ -767,7 +782,7 @@ async function runScan(domains) {
     }
     toast(`Scanned ${done} domain(s).`, 'ok');
   } catch (err) { toast(err.message, 'err'); }
-  btn.textContent = '🔍 Scan visible';
+  btn.textContent = '🔍 Scan';
   btn.disabled = false;
   scanning = false;
 }
@@ -1562,7 +1577,7 @@ async function runDiagSweep() {
     btn.textContent = `🩺 ${done}/${targets.length}…`;
   }
   pbLog(`<div style="margin-top:6px"><b>■ sweep complete</b> — <span style="color:var(--green)">${clean} clean</span> · <span style="color:var(--amber)">${warned} warnings-only</span> · <span style="color:var(--red)">${failing} failing</span>. Open a domain for its checklist; ⬇ export for the report.</div>`);
-  btn.textContent = '🩺 Diagnose visible';
+  btn.textContent = '🩺 Diagnose';
   btn.disabled = false;
   diagging = false;
 }
@@ -1587,10 +1602,14 @@ function updateUpDots() {
 function updateUpBoard() {
   const entries = Object.entries(state.health);
   const sum = $('#up-summary');
-  if (!entries.length) { sum.textContent = ''; $('#downs').innerHTML = ''; return; }
+  const wrap = $('#downs-wrap');
+  if (!entries.length) { sum.textContent = ''; wrap.style.display = 'none'; return; }
   const up = entries.filter(([, h]) => h.class === 'live').length;
   const downs = entries.filter(([, h]) => UP_BAD(h.class));
   sum.innerHTML = `<span style="color:var(--green);font-size:12px">▲ ${up} up</span> <span style="color:${downs.length ? 'var(--red)' : 'var(--dim)'};font-size:12px">▼ ${downs.length} down</span> <span style="color:var(--dim);font-size:11px">@ ${esc(state.lastProbe || '')}</span>`;
+  if (!downs.length) { wrap.style.display = 'none'; return; }
+  wrap.style.display = 'block';
+  $('#downs-sum').textContent = `▼ ${downs.length} down — expand for details`;
   $('#downs').innerHTML = downs
     .sort((a, b) => a[0].localeCompare(b[0]))
     .map(([d, h]) => `<span class="chip bad" data-down="${esc(d)}" title="${esc(h.detail || '')}">▼ ${esc(d)} — ${esc(h.class)}${h.status ? ' ' + h.status : ''}</span>`).join('');
