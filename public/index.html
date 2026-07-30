@@ -208,8 +208,17 @@
       <option value="status">sort: status (pending first)</option>
       <option value="name">sort: name</option>
     </select>
+    <span style="color:var(--dim);font-size:12px">⏱</span>
+    <select id="up-interval" title="Uptime scan interval" style="background:var(--panel);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:4px 6px;font-size:12px">
+      <option value="0">up-check: off</option>
+      <option value="60">every 1 min</option>
+      <option value="300">every 5 min</option>
+      <option value="900">every 15 min</option>
+    </select>
+    <span id="up-summary"></span>
     <span id="domain-count"></span>
   </div>
+  <div id="downs" style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px"></div>
 
   <div id="domains"><div class="loading">Loading domains…</div></div>
 </main>
@@ -222,6 +231,7 @@ const $$ = (sel, el = document) => [...el.querySelectorAll(sel)];
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 const state = {
   domains: [], detail: {}, scan: {}, chipFilter: null,
+  health: {}, lastProbe: '',
   pbMax: Number(localStorage.getItem('pbMax') || 20),
   queueRunning: false,
   playbooks: {},
@@ -270,6 +280,8 @@ function renderDash() {
     tile('active', buckets.active, 'active', 't-active', $('#filter-status').value === 'active'),
     tile('ready', scanned ? ready : '—', 'ready to cut', 't-ready', state.chipFilter === 'ready'),
     tile('needs-sync', scanned ? needSync : '—', 'need sync', 't-missing', state.chipFilter === 'needs-sync'),
+    tile('up', Object.keys(state.health).length ? Object.values(state.health).filter((h) => h.class === 'live').length : '—', '▲ up', 't-active', false),
+    tile('down', Object.keys(state.health).length ? Object.values(state.health).filter((h) => UP_BAD(h.class)).length : '—', '▼ down', 't-missing', state.chipFilter === 'down'),
     `<div class="tools">
       <button class="small primary" id="btn-bulk-create" ${createTargets.length ? '' : 'disabled'}>⚡ Create &amp; sync ${selZoneless.length ? `selected (${selZoneless.length})` : `all zoneless (${zoneless.length})`}</button>
       <button class="small danger" id="btn-bulk-cutover" ${ready ? '' : 'disabled'}>🚀 Cut over ready (${scanned ? ready : 0})</button>
@@ -295,7 +307,7 @@ function renderDash() {
       state.chipFilter = null;
       $('#filter-status').value = '';
       if (id === 'none' || id === 'pending' || id === 'active') $('#filter-status').value = id;
-      else if (id === 'ready' || id === 'needs-sync') state.chipFilter = id;
+      else if (id === 'ready' || id === 'needs-sync' || id === 'down') state.chipFilter = id;
       renderNotices();
       renderDomains();
     };
@@ -633,7 +645,9 @@ function visibleDomains() {
   const sortBy = $('#sort-by').value;
   let list = state.domains.filter((d) =>
     (!q || d.domain.includes(q)) && (!status || statusBucket(d) === status));
-  if (state.chipFilter) {
+  if (state.chipFilter === 'down') {
+    list = list.filter((d) => UP_BAD(state.health[d.domain]?.class));
+  } else if (state.chipFilter) {
     list = list.filter((d) => {
       const s = state.scan[d.domain];
       if (!s) return false;
@@ -665,6 +679,7 @@ function renderDomains() {
     <div class="domain" data-domain="${esc(d.domain)}">
       <div class="domain-head">
         <input type="checkbox" class="sel-domain" data-domain="${esc(d.domain)}" onclick="event.stopPropagation()">
+        <span class="up-dot" data-domain="${esc(d.domain)}">${upDot(d.domain)}</span>
         <span class="name">${esc(d.domain)}</span>
         ${zoneBadge(d.zoneStatus)}
         <span class="scan-slot">${scanBadges(d.domain)}</span>
@@ -808,9 +823,11 @@ function renderDetail(card, d) {
         <span class="badge pointed" title="Saved ${esc(d.rollback.at)} — previous NS: ${esc(d.rollback.previousNs.join(', ') || '(none)')}${d.rollback.rolledBackAt ? ' · ROLLED BACK ' + esc(d.rollback.rolledBackAt) : ''}">↩ rollback saved</span>
         <button class="small danger act-rollback" ${d.rollback.previousNs?.length ? '' : 'disabled'}>↩ Roll back NS</button>
         <span class="sep"></span>` : ''}
+      <button class="small act-probe-hosts" ${d.zone ? '' : 'disabled'} title="Probe every hostname in this zone">🔦 probe hosts</button>
       <button class="small act-reload">↻</button>
       <span style="color:var(--dim);font-size:12px">${counts.same} same · ${counts['enom-only']} missing in CF · ${counts['cf-only']} CF-only</span>
     </div>
+    <div class="hostprobe"></div>
     <table>
       <thead><tr><th></th><th>Enom</th><th></th><th>Cloudflare</th><th></th></tr></thead>
       <tbody>
@@ -986,6 +1003,29 @@ function renderDetail(card, d) {
     };
   });
 
+  const probeHostsBtn = $('.act-probe-hosts', el);
+  if (probeHostsBtn && !probeHostsBtn.disabled) {
+    probeHostsBtn.onclick = async () => {
+      const box = $('.hostprobe', el);
+      probeHostsBtn.disabled = true;
+      box.innerHTML = '<div class="loading">Probing every hostname in the zone…</div>';
+      try {
+        const { results } = await api(`/api/domain/probe-hosts?domain=${domain}`, { body: {} });
+        box.innerHTML = `
+          <table style="margin-bottom:10px">
+            <thead><tr><th>Host</th><th>State</th><th>ms</th><th>Detail</th></tr></thead>
+            <tbody>${results.map((r) => `
+              <tr><td style="font-family:var(--mono);font-size:12px">${esc(r.host)}</td>
+              <td style="font-family:var(--mono);font-size:12px;color:${HEALTH_COLORS[r.class] || 'var(--text)'}">${esc(r.class)}${r.status ? ' ' + r.status : ''}</td>
+              <td style="font-family:var(--mono);font-size:12px">${r.ms ?? ''}</td>
+              <td style="font-family:var(--mono);font-size:12px;word-break:break-all">${esc(r.detail || '')}</td></tr>`).join('')}
+            </tbody>
+          </table>`;
+      } catch (err) { box.innerHTML = `<div class="errors">✗ ${esc(err.message)}</div>`; }
+      probeHostsBtn.disabled = false;
+    };
+  }
+
   $('.act-reload', el).onclick = reload;
 }
 
@@ -1119,6 +1159,68 @@ $('#btn-find-proxied').onclick = async () => {
   } catch (err) { box.innerHTML = `<div class="errors">✗ ${esc(err.message)}</div>`; }
 };
 
+/* ---------- fleet uptime board ---------- */
+
+const HEALTH_COLORS = { live: 'var(--green)', 'pending-zone': 'var(--dim)', 'no-dns': 'var(--amber)', 'client-error': 'var(--amber)', 'server-error': 'var(--amber)', 'tls-error': 'var(--red)', 'origin-error': 'var(--red)', dead: 'var(--red)' };
+const UP_BAD = (c) => c && c !== 'live' && c !== 'pending-zone';
+
+function upDot(domain) {
+  const h = state.health[domain];
+  if (!h) return '';
+  const color = h.class === 'live' ? 'var(--green)' : h.class === 'pending-zone' ? 'var(--dim)' : 'var(--red)';
+  return `<span style="color:${color}" title="${esc(h.class)}${h.detail ? ' — ' + esc(h.detail) : ''}">●</span>`;
+}
+
+function updateUpDots() {
+  $$('.up-dot').forEach((el) => { el.innerHTML = upDot(el.dataset.domain); });
+}
+
+function updateUpBoard() {
+  const entries = Object.entries(state.health);
+  const sum = $('#up-summary');
+  if (!entries.length) { sum.textContent = ''; $('#downs').innerHTML = ''; return; }
+  const up = entries.filter(([, h]) => h.class === 'live').length;
+  const downs = entries.filter(([, h]) => UP_BAD(h.class));
+  sum.innerHTML = `<span style="color:var(--green);font-size:12px">▲ ${up} up</span> <span style="color:${downs.length ? 'var(--red)' : 'var(--dim)'};font-size:12px">▼ ${downs.length} down</span> <span style="color:var(--dim);font-size:11px">@ ${esc(state.lastProbe || '')}</span>`;
+  $('#downs').innerHTML = downs
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([d, h]) => `<span class="chip bad" data-down="${esc(d)}" title="${esc(h.detail || '')}">▼ ${esc(d)} — ${esc(h.class)}${h.status ? ' ' + h.status : ''}</span>`).join('');
+  $$('#downs .chip').forEach((ch) => {
+    ch.onclick = () => { $('#search').value = ch.dataset.down; renderDomains(); };
+  });
+}
+
+let probing = false;
+async function probeFleet() {
+  if (probing) return;
+  probing = true;
+  try {
+    const { results, probedAt } = await api('/api/tools/health', { body: {} });
+    for (const r of results) {
+      const prev = state.health[r.domain];
+      if (prev && prev.class !== r.class) toast(`uptime: ${r.domain} ${prev.class} → ${r.class}`, r.class === 'live' ? 'ok' : 'err');
+      state.health[r.domain] = r;
+    }
+    state.lastProbe = `${probedAt.slice(11, 19)}Z`;
+    updateUpDots();
+    updateUpBoard();
+    renderDash();
+  } catch (err) { toast(`fleet probe failed: ${err.message}`, 'err'); }
+  probing = false;
+}
+
+let upTimer = null;
+function setUpInterval(secs) {
+  clearInterval(upTimer);
+  upTimer = null;
+  localStorage.setItem('upInterval', String(secs));
+  if (secs > 0) {
+    upTimer = setInterval(probeFleet, secs * 1000);
+    probeFleet();
+  }
+}
+$('#up-interval').onchange = (e) => setUpInterval(Number(e.target.value));
+
 $('#btn-verify-ips').onclick = async () => {
   const box = $('#verifyip-results');
   box.innerHTML = '<span class="loading">Comparing every A/AAAA record against Enom source…</span>';
@@ -1188,6 +1290,11 @@ $('#btn-find-dmarc').onclick = async () => {
     if (!state.playbooks[state.pbSelected]) state.pbSelected = 'Full migration';
   } catch { /* selector falls back to Full migration */ }
   await refreshDomains();
+  const savedInterval = Number(localStorage.getItem('upInterval') || 0);
+  if (savedInterval && configured) {
+    $('#up-interval').value = String(savedInterval);
+    setUpInterval(savedInterval);
+  }
   // Auto-populate pills after load; rows fill in progressively as chunks return.
   if (configured && state.domains.length) runScan(state.domains.map((d) => d.domain));
 })();

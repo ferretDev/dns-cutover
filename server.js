@@ -179,6 +179,62 @@ async function syncRecords(domain, direction, keys) {
   return results;
 }
 
+/**
+ * Probe one hostname over HTTPS (manual redirects, 10s timeout) and classify.
+ * Falls back to plain HTTP to distinguish cert-only failures.
+ */
+const PROBE_ORDER = { dead: 0, 'origin-error': 1, 'tls-error': 2, 'server-error': 3, 'client-error': 4, 'no-dns': 5, 'pending-zone': 6, live: 7 };
+
+async function probeHost(hostname) {
+  const out = {};
+  const started = Date.now();
+  try {
+    const res = await fetch(`https://${hostname}/`, {
+      redirect: 'manual',
+      signal: AbortSignal.timeout(10_000),
+      headers: { 'user-agent': 'dns-cutover-health/1.0' },
+    });
+    out.ms = Date.now() - started;
+    out.status = res.status;
+    if (res.status >= 300 && res.status < 400) {
+      out.class = 'live';
+      out.detail = `→ ${res.headers.get('location') || '(redirect)'}`;
+    } else if (res.status >= 200 && res.status < 300) {
+      out.class = 'live';
+    } else if (res.status >= 520 && res.status <= 526) {
+      out.class = 'origin-error';
+      out.detail = `Cloudflare ${res.status} — origin refused/misconfigured for this hostname`;
+    } else if (res.status >= 500) {
+      out.class = 'server-error';
+      out.detail = `HTTP ${res.status}`;
+    } else {
+      out.class = 'client-error';
+      out.detail = `HTTP ${res.status}`;
+    }
+  } catch (e) {
+    out.ms = Date.now() - started;
+    const reason = String(e.cause?.code || e.name || e.message);
+    if (reason === 'ENOTFOUND') {
+      out.class = 'no-dns';
+      out.detail = 'name does not resolve — no A/AAAA/CNAME in effect, or NS moved away';
+      return out;
+    }
+    if (reason.includes('SELF_SIGNED') || reason.includes('CERT_')) {
+      out.class = 'tls-error';
+      out.detail = `origin certificate invalid (${reason}) — record is DNS-only; proxy it or install a real cert`;
+      return out;
+    }
+    out.class = 'dead';
+    out.detail = reason;
+    try {
+      const r2 = await fetch(`http://${hostname}/`, { redirect: 'manual', signal: AbortSignal.timeout(8_000) });
+      out.class = 'tls-error';
+      out.detail = `HTTPS fails (${reason}) but HTTP answers ${r2.status} — certificate problem`;
+    } catch { /* both dead — keep 'dead' */ }
+  }
+  return out;
+}
+
 /* ---------- playbook: the full migration pipeline for one domain ---------- */
 
 // Hostnames that must never be proxied — pure-DNS mail infrastructure.
@@ -582,6 +638,32 @@ const routes = {
     });
     found.sort((a, b) => a.domain.localeCompare(b.domain));
     return { found, zonesScanned: zones.length };
+  },
+
+  'POST /api/tools/health': async () => {
+    const zones = await cloudflare.listZones();
+    const results = await pooled(zones, 8, async (z) => {
+      if (z.status !== 'active') {
+        return { domain: z.name, class: 'pending-zone', detail: `zone ${z.status} — NS not confirmed, edge cert not issued` };
+      }
+      return { domain: z.name, ...(await probeHost(z.name)) };
+    });
+    const clean = results.filter(Boolean);
+    clean.sort((a, b) => (PROBE_ORDER[a.class] ?? 9) - (PROBE_ORDER[b.class] ?? 9) || a.domain.localeCompare(b.domain));
+    return { results: clean, probedAt: new Date().toISOString() };
+  },
+
+  'POST /api/domain/probe-hosts': async (req, res, domain) => {
+    const zone = assertZone(await cloudflare.getZone(domain), domain);
+    if (!zone) throw new Error('No Cloudflare zone.');
+    const recs = await cloudflare.listRecords(zone.id);
+    const names = [...new Set(recs
+      .filter((r) => ['A', 'AAAA', 'CNAME'].includes(r.type) && !r.name.startsWith('_') && !r.name.includes('._') && !r.name.includes('*'))
+      .map((r) => r.name.toLowerCase()))];
+    const results = await pooled(names, 6, async (name) => ({ host: name, ...(await probeHost(name)) }));
+    const clean = results.filter(Boolean);
+    clean.sort((a, b) => (PROBE_ORDER[a.class] ?? 9) - (PROBE_ORDER[b.class] ?? 9) || a.host.localeCompare(b.host));
+    return { results: clean, probedAt: new Date().toISOString() };
   },
 
   'POST /api/tools/verify-source-ips': async () => {
