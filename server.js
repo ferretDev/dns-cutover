@@ -4,6 +4,7 @@
  *   node server.js   ->   http://127.0.0.1:8787
  */
 import { createServer } from 'node:http';
+import { promises as dnsp } from 'node:dns';
 import { readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -657,11 +658,36 @@ const routes = {
     const zone = assertZone(await cloudflare.getZone(domain), domain);
     if (!zone) throw new Error('No Cloudflare zone.');
     const recs = await cloudflare.listRecords(zone.id);
-    const names = [...new Set(recs
+    const allNames = [...new Set(recs
       .filter((r) => ['A', 'AAAA', 'CNAME'].includes(r.type) && !r.name.startsWith('_') && !r.name.includes('._') && !r.name.includes('*'))
       .map((r) => r.name.toLowerCase()))];
-    const results = await pooled(names, 6, async (name) => ({ host: name, ...(await probeHost(name)) }));
-    const clean = results.filter(Boolean);
+    // Service hostnames aren't websites — an HTTP error is their normal state.
+    // The meaningful check for them (like MX) is: does the name resolve?
+    const SERVICE_PREFIXES = ['autodiscover', 'sip', 'lyncdiscover', 'enterpriseregistration', 'enterpriseenrollment', 'pm-bounces', 'msoid'];
+    const isService = (n) => SERVICE_PREFIXES.includes(n.split('.')[0]);
+    const webNames = allNames.filter((n) => !isService(n));
+    const serviceNames = allNames.filter(isService);
+    const results = await pooled(webNames, 6, async (name) => ({ host: name, ...(await probeHost(name)) }));
+    const serviceResults = await pooled(serviceNames, 6, async (name) => {
+      try {
+        const addr = await dnsp.lookup(name);
+        return { host: name, class: 'live', detail: `service host — resolves (${addr.address})` };
+      } catch {
+        return { host: name, class: 'no-dns', detail: 'service host does not resolve' };
+      }
+    });
+    results.push(...serviceResults);
+    // MX targets get a resolution check, not an HTTP probe — mail hosts aren't websites.
+    const mxTargets = [...new Set(recs.filter((r) => r.type === 'MX').map((r) => r.content.toLowerCase().replace(/\.$/, '')))];
+    const mxResults = await pooled(mxTargets, 6, async (t) => {
+      try {
+        const addr = await dnsp.lookup(t);
+        return { host: `MX → ${t}`, class: 'live', detail: `resolves (${addr.address})` };
+      } catch {
+        return { host: `MX → ${t}`, class: 'no-dns', detail: 'MX target does not resolve — mail is undeliverable' };
+      }
+    });
+    const clean = [...results, ...mxResults].filter(Boolean);
     clean.sort((a, b) => (PROBE_ORDER[a.class] ?? 9) - (PROBE_ORDER[b.class] ?? 9) || a.host.localeCompare(b.host));
     return { results: clean, probedAt: new Date().toISOString() };
   },

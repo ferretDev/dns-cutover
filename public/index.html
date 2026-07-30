@@ -1042,6 +1042,8 @@ async function loadDetail(card, domain) {
     const slot = $('.scan-slot', card);
     if (slot) slot.innerHTML = scanBadges(domain);
     renderNotices();
+    // Auto-probe the zone's standard records (A/CNAME via HTTP, MX via DNS) on open.
+    if (d.zone) $('.act-probe-hosts', card)?.click();
   } catch (err) {
     el.innerHTML = `<div class="errors">✗ ${esc(err.message)}</div>`;
   }
