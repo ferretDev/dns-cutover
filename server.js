@@ -236,6 +236,120 @@ async function probeHost(hostname) {
   return out;
 }
 
+/* ---------- site diagnostics: deep on-demand sweep of a live site ---------- */
+
+const DIAG_UA = 'dns-cutover-diag/1.0';
+const diagFetch = (url, timeout = 12_000) =>
+  fetch(url, { redirect: 'manual', signal: AbortSignal.timeout(timeout), headers: { 'user-agent': DIAG_UA } });
+
+async function followChain(startUrl, timeout = 12_000, maxHops = 6) {
+  let url = startUrl;
+  const chain = [];
+  let res = null;
+  for (let i = 0; i < maxHops; i++) {
+    res = await diagFetch(url, timeout);
+    if (res.status >= 300 && res.status < 400 && res.headers.get('location')) {
+      const next = new URL(res.headers.get('location'), url).href;
+      if (chain.includes(next)) return { res, url, chain, loop: true };
+      chain.push(next);
+      url = next;
+      continue;
+    }
+    break;
+  }
+  return { res, url, chain, loop: false };
+}
+
+async function diagnoseSite(domain) {
+  const checks = [];
+  const add = (label, status, detail = '') => checks.push({ label, status, detail });
+  const summary = () => ({
+    domain,
+    checks,
+    fails: checks.filter((c) => c.status === 'fail').length,
+    warns: checks.filter((c) => c.status === 'warn').length,
+  });
+
+  let res, finalUrl, chain;
+  const t0 = Date.now();
+  try {
+    const out = await followChain(`https://${domain}/`);
+    if (out.loop) { add('Redirect loop', 'fail', out.chain.join(' → ')); return summary(); }
+    ({ res, url: finalUrl, chain } = out);
+  } catch (e) {
+    add('Site reachable', 'fail', String(e.cause?.code || e.name || e.message));
+    return summary();
+  }
+  const ms = Date.now() - t0;
+
+  if (res.status >= 200 && res.status < 300) add('Site reachable', 'pass', `${res.status} at ${finalUrl} (${ms}ms)`);
+  else add('Site reachable', 'fail', `final status ${res.status} at ${finalUrl}`);
+  if (chain.length >= 3) add('Redirect chain', 'warn', `${chain.length} hops: ${chain.join(' → ')}`);
+  else if (chain.length) add('Redirect chain', 'pass', chain.join(' → '));
+  const finalHost = new URL(finalUrl).hostname;
+  if (!finalHost.endsWith(domain)) add('Lands off-domain', 'info', `final host ${finalHost}`);
+
+  const h = res.headers;
+  add('Cloudflare proxied', h.get('cf-ray') ? 'pass' : 'info', h.get('cf-ray') ? '' : 'no cf-ray header — served direct (DNS-only)');
+  add('HSTS', h.get('strict-transport-security') ? 'pass' : 'warn', h.get('strict-transport-security') ? '' : 'no Strict-Transport-Security header');
+  add('X-Content-Type-Options', h.get('x-content-type-options') ? 'pass' : 'warn', h.get('x-content-type-options') ? '' : 'nosniff missing');
+  const hasFrameGuard = h.get('content-security-policy') || h.get('x-frame-options');
+  add('Clickjacking protection', hasFrameGuard ? 'pass' : 'warn', hasFrameGuard ? '' : 'no CSP or X-Frame-Options');
+
+  let body = '';
+  try { body = (await res.text()).slice(0, 400_000); } catch { /* body unavailable */ }
+  const lower = body.toLowerCase();
+
+  const noindex = /<meta[^>]+name=["']robots["'][^>]*noindex/i.test(body) || /noindex/i.test(h.get('x-robots-tag') || '');
+  add('Indexable (no noindex)', noindex ? 'fail' : 'pass', noindex ? 'noindex present — search engines are excluded!' : '');
+
+  const title = body.match(/<title[^>]*>([^<]*)<\/title>/i)?.[1]?.trim();
+  add('Page <title>', title ? 'pass' : 'warn', title ? title.slice(0, 80) : 'missing');
+  add('Meta description', /<meta[^>]+name=["']description["']/i.test(body) ? 'pass' : 'warn', '');
+  add('<h1> present', /<h1[\s>]/i.test(body) ? 'pass' : 'warn', '');
+
+  const parked = ['welcome to nginx', 'apache2 ubuntu default', 'index of /', 'wp-admin/install.php',
+    'this domain is parked', 'account suspended', 'default web site page'].find((s) => lower.includes(s));
+  if (parked) add('Placeholder/parked page', 'fail', `page contains "${parked}"`);
+
+  if (finalUrl.startsWith('https://')) {
+    const mixed = (body.match(/(?:src|href)=["']http:\/\//gi) || []).length;
+    add('Mixed content', mixed ? 'warn' : 'pass', mixed ? `${mixed} http:// reference(s) in HTML` : '');
+  }
+
+  try {
+    const r = await diagFetch(`http://${domain}/`, 8_000);
+    if (r.status >= 300 && r.status < 400 && (r.headers.get('location') || '').startsWith('https://')) add('HTTP → HTTPS redirect', 'pass', '');
+    else if (r.status >= 200 && r.status < 300) add('HTTP → HTTPS redirect', 'warn', `plain HTTP serves ${r.status} without redirecting`);
+    else add('HTTP → HTTPS redirect', 'info', `HTTP answers ${r.status}`);
+  } catch { add('HTTP → HTTPS redirect', 'info', 'plain HTTP not answering'); }
+
+  try {
+    const w = await followChain(`https://www.${domain}/`, 8_000);
+    if (w.res.status >= 200 && w.res.status < 300) {
+      const same = new URL(w.url).hostname.replace(/^www\./, '') === finalHost.replace(/^www\./, '');
+      add('www variant', same ? 'pass' : 'warn', same ? '' : `www lands at ${w.url}`);
+    } else {
+      add('www variant', 'warn', `www final status ${w.res.status}`);
+    }
+  } catch (e) {
+    add('www variant', 'warn', `www unreachable (${String(e.cause?.code || e.name)})`);
+  }
+
+  try {
+    const rb = await diagFetch(`https://${domain}/robots.txt`, 8_000);
+    if (rb.status === 200) {
+      const rtxt = (await rb.text()).slice(0, 10_000);
+      const blockAll = /user-agent:\s*\*/i.test(rtxt) && /^\s*disallow:\s*\/\s*$/im.test(rtxt);
+      add('robots.txt', blockAll ? 'fail' : 'pass', blockAll ? 'Disallow: / for all agents — blocks all crawling!' : '');
+    } else {
+      add('robots.txt', 'info', `status ${rb.status}`);
+    }
+  } catch { add('robots.txt', 'info', 'unreachable'); }
+
+  return summary();
+}
+
 /* ---------- playbook: the full migration pipeline for one domain ---------- */
 
 // Hostnames that must never be proxied — pure-DNS mail infrastructure.
@@ -639,6 +753,12 @@ const routes = {
     });
     found.sort((a, b) => a.domain.localeCompare(b.domain));
     return { found, zonesScanned: zones.length };
+  },
+
+  'POST /api/tools/diagnose': async (req) => {
+    const { domains = [] } = await readBody(req);
+    const results = await pooled(domains, 5, diagnoseSite);
+    return { results: results.filter(Boolean) };
   },
 
   'POST /api/tools/health': async () => {

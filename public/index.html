@@ -196,6 +196,7 @@
     <span id="sel-count">0 selected</span>
     <button class="small primary" id="btn-batch-sync">Batch sync selected → Cloudflare</button>
     <button class="small" id="btn-scan">🔍 Scan visible</button>
+    <button class="small" id="btn-diag">🩺 Diagnose visible</button>
     <span class="spacer"></span>
     <input id="search" placeholder="filter…" style="background:var(--panel);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:4px 8px;font-family:var(--mono);font-size:12px;width:160px">
     <select id="filter-status" style="background:var(--panel);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:4px 6px;font-size:12px">
@@ -234,6 +235,7 @@ const state = {
   domains: [], detail: {}, scan: {}, chipFilter: null,
   health: {}, lastProbe: '',
   autoProbe: localStorage.getItem('autoProbe') !== 'off',
+  diag: {},
   pbMax: Number(localStorage.getItem('pbMax') || 20),
   queueRunning: false,
   playbooks: {},
@@ -826,10 +828,12 @@ function renderDetail(card, d) {
         <button class="small danger act-rollback" ${d.rollback.previousNs?.length ? '' : 'disabled'}>↩ Roll back NS</button>
         <span class="sep"></span>` : ''}
       <button class="small act-probe-hosts" ${d.zone ? '' : 'disabled'} title="Probe every hostname in this zone">🔦 probe hosts</button>
+      <button class="small act-diag" ${d.zone ? '' : 'disabled'} title="Deep site diagnostic (redirects, headers, indexability, content sanity)">🩺 diagnose</button>
       <button class="small act-reload">↻</button>
       <span style="color:var(--dim);font-size:12px">${counts.same} same · ${counts['enom-only']} missing in CF · ${counts['cf-only']} CF-only</span>
     </div>
     <div class="hostprobe"></div>
+    <div class="diagslot">${diagHtml(d.domain)}</div>
     <table>
       <thead><tr><th></th><th>Enom</th><th></th><th>Cloudflare</th><th></th></tr></thead>
       <tbody>
@@ -1028,6 +1032,25 @@ function renderDetail(card, d) {
     };
   }
 
+  const diagBtn = $('.act-diag', el);
+  if (diagBtn && !diagBtn.disabled) {
+    diagBtn.onclick = async () => {
+      diagBtn.disabled = true;
+      const slot = $('.diagslot', el);
+      slot.innerHTML = '<div class="loading">Running site diagnostics…</div>';
+      try {
+        const { results } = await api('/api/tools/diagnose', { body: { domains: [domain] } });
+        if (results[0]?.checks) {
+          state.diag[domain] = results[0];
+          slot.innerHTML = diagHtml(domain);
+        } else {
+          slot.innerHTML = `<div class="errors">✗ ${esc(results[0]?.error || 'no result')}</div>`;
+        }
+      } catch (err) { slot.innerHTML = `<div class="errors">✗ ${esc(err.message)}</div>`; }
+      diagBtn.disabled = false;
+    };
+  }
+
   $('.act-reload', el).onclick = reload;
 }
 
@@ -1162,6 +1185,59 @@ $('#btn-find-proxied').onclick = async () => {
       });
   } catch (err) { box.innerHTML = `<div class="errors">✗ ${esc(err.message)}</div>`; }
 };
+
+/* ---------- diagnostic sweeper ---------- */
+
+const DIAG_ICONS = { pass: '<span style="color:var(--green)">✓</span>', warn: '<span style="color:var(--amber)">⚠</span>', fail: '<span style="color:var(--red)">✗</span>', info: '<span style="color:var(--dim)">·</span>' };
+
+function diagHtml(domain) {
+  const dg = state.diag[domain];
+  if (!dg) return '';
+  return `<details class="diagbox" ${dg.fails ? 'open' : ''} style="margin-top:10px;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:6px 12px;font-family:var(--mono);font-size:12px">
+    <summary style="cursor:pointer">🩺 Diagnostics — ${dg.fails ? `<span style="color:var(--red)">${dg.fails} fail</span>` : '<span style="color:var(--green)">clean</span>'}${dg.warns ? ` · <span style="color:var(--amber)">${dg.warns} warn</span>` : ''}</summary>
+    ${dg.checks.map((c) => `<div>${DIAG_ICONS[c.status] || c.status} ${esc(c.label)}${c.detail ? ` <span style="color:var(--dim)">— ${esc(c.detail)}</span>` : ''}</div>`).join('')}
+  </details>`;
+}
+
+function updateDiagSlot(domain) {
+  const card = document.querySelector(`.domain[data-domain="${CSS.escape(domain)}"]`);
+  if (card) { const slot = $('.diagslot', card); if (slot) slot.innerHTML = diagHtml(domain); }
+}
+
+let diagging = false;
+async function runDiagSweep() {
+  if (diagging) return;
+  const targets = visibleDomains().filter((d) => d.zoneStatus === 'active').map((d) => d.domain);
+  if (!targets.length) { toast('No active zones in view to diagnose.', 'err'); return; }
+  if (!confirm(`Deep-diagnose ${targets.length} site(s)?\n\nEach gets ~4 real requests (homepage + redirect chain, plain HTTP, www variant, robots.txt) and checks: reachability, redirect health, security headers, indexability (noindex/robots), content sanity, parked-page detection, mixed content, www parity.\n\nReport streams below; each domain's checklist lands in its accordion. ⬇ export when done.`)) return;
+  diagging = true;
+  const btn = $('#btn-diag');
+  btn.disabled = true;
+  pbLogReset();
+  pbLog(`<div><b>🩺 Diagnostic sweep</b> — ${targets.length} site(s)</div>`);
+  let clean = 0, warned = 0, failing = 0, done = 0;
+  for (let i = 0; i < targets.length; i += 5) {
+    const chunk = targets.slice(i, i + 5);
+    try {
+      const { results } = await api('/api/tools/diagnose', { body: { domains: chunk } });
+      for (const r of results) {
+        if (!r || !r.domain) continue;
+        state.diag[r.domain] = r;
+        if (r.fails) failing++; else if (r.warns) warned++; else clean++;
+        const worst = r.checks.find((c) => c.status === 'fail') || r.checks.find((c) => c.status === 'warn');
+        pbLog(`<div style="padding-left:14px">${r.fails ? DIAG_ICONS.fail : r.warns ? DIAG_ICONS.warn : DIAG_ICONS.pass} <b>${esc(r.domain)}</b> — ${r.fails} fail · ${r.warns} warn${worst ? ` <span style="color:var(--dim)">(${esc(worst.label)}${worst.detail ? ': ' + esc(worst.detail.slice(0, 70)) : ''})</span>` : ''}</div>`);
+        updateDiagSlot(r.domain);
+      }
+    } catch (err) { pbLog(`<div style="color:var(--red)">✗ chunk failed: ${esc(err.message)}</div>`); }
+    done += chunk.length;
+    btn.textContent = `🩺 ${done}/${targets.length}…`;
+  }
+  pbLog(`<div style="margin-top:6px"><b>■ sweep complete</b> — <span style="color:var(--green)">${clean} clean</span> · <span style="color:var(--amber)">${warned} warnings-only</span> · <span style="color:var(--red)">${failing} failing</span>. Open a domain for its checklist; ⬇ export for the report.</div>`);
+  btn.textContent = '🩺 Diagnose visible';
+  btn.disabled = false;
+  diagging = false;
+}
+$('#btn-diag').onclick = runDiagSweep;
 
 /* ---------- fleet uptime board ---------- */
 
