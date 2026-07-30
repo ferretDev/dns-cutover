@@ -165,6 +165,14 @@
       </div>
     </div>
     <div style="margin-bottom:18px">
+      <b>🚚 Registrar transfers</b>
+      <div style="color:var(--dim);font-size:12px;margin:2px 0 8px">Per-domain transfer readiness: registrar lock + WHOIS privacy live from Enom, transfer progress from public RDAP (registrar of record, pendingTransfer). EPP codes are emailed to the registrant — the board tracks when. "Prep" = unlock + privacy off + EPP email in one shot.</div>
+      <button class="small" id="btn-transfer-board">Load board (selected / visible)</button>
+      <button class="small primary" id="btn-transfer-prep" disabled>🚚 Prep checked for transfer</button>
+      <span id="transfer-summary" style="font-size:12px;color:var(--dim)"></span>
+      <div id="transfer-results" style="margin-top:8px"></div>
+    </div>
+    <div style="margin-bottom:18px">
       <b>Missing @ / www records</b>
       <div style="color:var(--dim);font-size:12px;margin:2px 0 8px">A <code>*</code> wildcard does NOT cover the apex — a zone with only <code>*</code> leaves <code>@</code> unresolvable. Finds zones missing <code>@</code> (mirror from <code>*</code>, else <code>www</code>) or missing <code>www</code> with no wildcard (mirror from <code>@</code>), probing the source first so you never clone a dead value. Zones with nothing to mirror get clone-candidate recommendations.</div>
       <button class="small" id="btn-find-apex">Find missing @ / www</button>
@@ -1207,6 +1215,85 @@ function toolResultsTable(container, rows, cols, actionLabel, onApply) {
     await onApply(selected, container);
   };
 }
+
+/* ---------- registrar transfer board ---------- */
+
+let transferRows = [];
+
+function transferBadges(r) {
+  const b = [];
+  if (r.transferredAway) return `<span style="color:var(--green)">✓ transferred → ${esc(r.registrar || '?')}</span>`;
+  if (r.pendingTransfer) b.push('<span style="color:var(--blue)">⏳ pending transfer</span>');
+  b.push(r.locked === false ? '<span style="color:var(--green)">🔓 unlocked</span>'
+    : r.locked === true ? '<span style="color:var(--amber)">🔒 locked</span>'
+    : `<span style="color:var(--dim)" title="${esc(r.lockNote || '')}">lock ?</span>`);
+  b.push(r.privacy === false ? '<span style="color:var(--green)">👁 privacy off</span>'
+    : r.privacy === true ? '<span style="color:var(--amber)">🕶 privacy on</span>'
+    : `<span style="color:var(--dim)" title="${esc(r.privacyNote || '')}">privacy ?</span>`);
+  b.push(r.eppSentAt ? `<span style="color:var(--green)">✉ EPP ${esc(r.eppSentAt.slice(0, 10))}</span>` : '<span style="color:var(--dim)">✉ EPP not sent</span>');
+  if (r.transferProhibited && r.locked === false) b.push('<span style="color:var(--amber)" title="Registry still shows transferProhibited — may lag after unlock">⚠ registry lock flag</span>');
+  return b.join(' · ');
+}
+
+function renderTransferBoard() {
+  const box = $('#transfer-results');
+  if (!transferRows.length) { box.innerHTML = ''; return; }
+  const ready = transferRows.filter((r) => !r.transferredAway && r.locked === false && r.privacy !== true && r.eppSentAt).length;
+  const doneCount = transferRows.filter((r) => r.transferredAway).length;
+  const pending = transferRows.filter((r) => r.pendingTransfer).length;
+  $('#transfer-summary').textContent = `${transferRows.length} domain(s) · ${doneCount} transferred · ${pending} pending · ${ready} prepped & waiting`;
+  box.innerHTML = `
+    <table>
+      <thead><tr><th><input type="checkbox" class="tf-all"></th><th>Domain</th><th>Readiness</th><th>Registrar (RDAP)</th></tr></thead>
+      <tbody>${transferRows.map((r, i) => `
+        <tr>
+          <td class="sel"><input type="checkbox" class="tf-row" data-i="${i}" ${r.transferredAway ? 'disabled' : ''}></td>
+          <td style="font-family:var(--mono);font-size:12px">${esc(r.domain)}</td>
+          <td style="font-family:var(--mono);font-size:12px">${transferBadges(r)}</td>
+          <td style="font-family:var(--mono);font-size:12px">${esc(r.registrar || r.rdapNote || '?')}</td>
+        </tr>`).join('')}
+      </tbody>
+    </table>`;
+  const refreshPrep = () => { $('#btn-transfer-prep').disabled = !$$('.tf-row:checked', box).length; };
+  $('.tf-all', box).onchange = (e) => { $$('.tf-row:not(:disabled)', box).forEach((cb) => { cb.checked = e.target.checked; }); refreshPrep(); };
+  $$('.tf-row', box).forEach((cb) => { cb.onchange = refreshPrep; });
+}
+
+$('#btn-transfer-board').onclick = async () => {
+  const sel = $$('.sel-domain:checked').map((cb) => cb.dataset.domain);
+  const domains = sel.length ? sel : visibleDomains().map((d) => d.domain);
+  if (!domains.length) { toast('Nothing to load.', 'err'); return; }
+  const box = $('#transfer-results');
+  const btn = $('#btn-transfer-board');
+  btn.disabled = true;
+  box.innerHTML = `<span class="loading">Checking lock + privacy (Enom) and registrar (RDAP) for ${domains.length} domain(s)…</span>`;
+  try {
+    transferRows = [];
+    for (let i = 0; i < domains.length; i += 8) {
+      const { rows } = await api('/api/transfer/board', { body: { domains: domains.slice(i, i + 8) } });
+      transferRows.push(...rows.filter((r) => r && r.domain));
+      btn.textContent = `Loading ${Math.min(i + 8, domains.length)}/${domains.length}…`;
+      renderTransferBoard();
+    }
+  } catch (err) { box.innerHTML = `<div class="errors">✗ ${esc(err.message)}</div>`; }
+  btn.textContent = 'Load board (selected / visible)';
+  btn.disabled = false;
+};
+
+$('#btn-transfer-prep').onclick = async () => {
+  const box = $('#transfer-results');
+  const checked = $$('.tf-row:checked', box).map((cb) => transferRows[Number(cb.dataset.i)].domain);
+  if (!checked.length) return;
+  if (!confirm(`Prep ${checked.length} domain(s) for registrar transfer?\n\nEach gets: registrar lock removed → WHOIS privacy disabled → EPP/auth code EMAILED to the registrant contact.\n\nMake sure you can read the registrant mailboxes before doing this in bulk.`)) return;
+  const btn = $('#btn-transfer-prep');
+  btn.disabled = true;
+  try {
+    const { results } = await api('/api/transfer/prep', { body: { domains: checked } });
+    for (const r of results) toast(`${r.domain}: ${r.steps.join(' · ')}`, r.steps.some((s) => s.includes('failed')) ? 'err' : 'ok');
+    $('#btn-transfer-board').click();
+  } catch (err) { toast(err.message, 'err'); }
+  btn.disabled = false;
+};
 
 $('#btn-find-apex').onclick = async () => {
   const box = $('#apex-results');

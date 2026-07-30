@@ -17,6 +17,7 @@ import {
 import { analyzeMail } from './lib/mailcheck.js';
 import { getRollbacks, saveRollback, markRolledBack } from './lib/rollback.js';
 import { getPlaybooks, savePlaybook, deletePlaybook } from './lib/playbooks.js';
+import { getTransfers, recordTransfer } from './lib/transfers.js';
 
 const root = dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 8899);
@@ -234,6 +235,59 @@ async function probeHost(hostname) {
     } catch { /* both dead — keep 'dead' */ }
   }
   return out;
+}
+
+/* ---------- registrar transfers ---------- */
+
+/**
+ * RDAP is the truth for transfer progress: registrar of record + status codes
+ * (pendingTransfer) straight from the registry, no auth, gaining-registrar agnostic.
+ */
+async function rdapLookup(domain) {
+  try {
+    const res = await fetch(`https://rdap.org/domain/${encodeURIComponent(domain)}`, {
+      signal: AbortSignal.timeout(12_000),
+      headers: { accept: 'application/rdap+json' },
+    });
+    if (!res.ok) return { registrar: null, statuses: [], note: `RDAP ${res.status}` };
+    const j = await res.json();
+    let registrar = null;
+    for (const e of j.entities || []) {
+      if ((e.roles || []).includes('registrar')) {
+        const fn = (e.vcardArray?.[1] || []).find((v) => v[0] === 'fn');
+        registrar = fn?.[3] || e.handle || null;
+      }
+    }
+    return { registrar, statuses: j.status || [] };
+  } catch (e) {
+    return { registrar: null, statuses: [], note: String(e.cause?.code || e.name) };
+  }
+}
+
+async function transferRow(domain) {
+  const [lockR, wppsR, rdapR] = await Promise.allSettled([
+    enom.getRegLock(domain),
+    enom.getWppsInfo(domain),
+    rdapLookup(domain),
+  ]);
+  const rdap = rdapR.status === 'fulfilled' ? rdapR.value : { registrar: null, statuses: [] };
+  const saved = getTransfers()[domain] || {};
+  const statuses = rdap.statuses || [];
+  return {
+    domain,
+    locked: lockR.status === 'fulfilled' ? lockR.value : null,
+    lockNote: lockR.status === 'rejected' ? lockR.reason.message : '',
+    privacy: wppsR.status === 'fulfilled' ? wppsR.value.exists : null,
+    privacyNote: wppsR.status === 'rejected' ? wppsR.reason.message : '',
+    registrar: rdap.registrar,
+    rdapNote: rdap.note || '',
+    pendingTransfer: statuses.some((s) => /pending ?transfer/i.test(s)),
+    transferProhibited: statuses.some((s) => /transfer ?prohibited/i.test(s)),
+    transferredAway: !!(rdap.registrar && !/enom|tucows/i.test(rdap.registrar)),
+    eppSentAt: saved.eppSentAt || null,
+    unlockedAt: saved.unlockedAt || null,
+    privacyOffAt: saved.privacyOffAt || null,
+  };
 }
 
 /* ---------- site diagnostics: deep on-demand sweep of a live site ---------- */
@@ -740,6 +794,7 @@ const routes = {
     if (unlock) {
       try {
         await enom.setRegLock(domain, false);
+        recordTransfer(domain, { unlockedAt: new Date().toISOString() });
         steps.push({ step: 'unlock', ok: true, message: 'Registrar lock removed' });
       } catch (err) {
         steps.push({ step: 'unlock', ok: false, message: err.message });
@@ -747,11 +802,74 @@ const routes = {
     }
     try {
       await enom.emailEppKey(domain);
+      recordTransfer(domain, { eppSentAt: new Date().toISOString() });
       steps.push({ step: 'epp', ok: true, message: 'EPP/auth code emailed to the registrant contact' });
     } catch (err) {
       steps.push({ step: 'epp', ok: false, message: err.message });
     }
     return { steps };
+  },
+
+  'POST /api/transfer/board': async (req) => {
+    const { domains = [] } = await readBody(req);
+    const rows = await pooled(domains, 4, transferRow);
+    return { rows: rows.filter(Boolean) };
+  },
+
+  'POST /api/transfer/action': async (req, res, domain) => {
+    if (!domain) throw new Error('Missing ?domain=');
+    const { action } = await readBody(req);
+    if (action === 'unlock') {
+      await enom.setRegLock(domain, false);
+      recordTransfer(domain, { unlockedAt: new Date().toISOString() });
+      return { ok: true, message: 'Registrar lock removed' };
+    }
+    if (action === 'privacy-off') {
+      await enom.disableWpps(domain);
+      recordTransfer(domain, { privacyOffAt: new Date().toISOString() });
+      return { ok: true, message: 'WHOIS privacy disabled' };
+    }
+    if (action === 'epp') {
+      await enom.emailEppKey(domain);
+      recordTransfer(domain, { eppSentAt: new Date().toISOString() });
+      return { ok: true, message: 'EPP/auth code emailed to registrant' };
+    }
+    throw new Error(`Unknown action "${action}"`);
+  },
+
+  'POST /api/transfer/prep': async (req) => {
+    const { domains = [] } = await readBody(req);
+    const results = [];
+    for (const domain of domains) {
+      const steps = [];
+      try {
+        const locked = await enom.getRegLock(domain).catch(() => null);
+        if (locked) {
+          await enom.setRegLock(domain, false);
+          recordTransfer(domain, { unlockedAt: new Date().toISOString() });
+          steps.push('unlocked');
+        } else {
+          steps.push(locked === false ? 'already unlocked' : 'lock state unknown');
+        }
+      } catch (e) { steps.push(`unlock failed: ${e.message}`); }
+      try {
+        const wpps = await enom.getWppsInfo(domain).catch(() => null);
+        if (wpps?.exists) {
+          await enom.disableWpps(domain);
+          recordTransfer(domain, { privacyOffAt: new Date().toISOString() });
+          steps.push('privacy off');
+        } else {
+          steps.push('no privacy service');
+        }
+      } catch (e) { steps.push(`privacy-off failed: ${e.message}`); }
+      try {
+        await enom.emailEppKey(domain);
+        recordTransfer(domain, { eppSentAt: new Date().toISOString() });
+        steps.push('EPP emailed');
+      } catch (e) { steps.push(`EPP failed: ${e.message}`); }
+      results.push({ domain, steps });
+    }
+    return { results };
   },
 
   'POST /api/scan': async (req) => {
