@@ -574,6 +574,37 @@ const routes = {
 
   'GET /api/domain': async (req, res, domain) => domainState(domain),
 
+  'POST /api/email-report': async (req) => {
+    const { subject, markdown, to } = await readBody(req);
+    if (!subject || !markdown) throw new Error('subject and markdown are required');
+    if (!process.env.POSTMARK_TOKEN) throw new Error('POSTMARK_TOKEN not set — add it in ⚙ API Keys');
+    const from = process.env.REPORT_FROM;
+    if (!from) throw new Error('REPORT_FROM not set — must be a verified Postmark sender signature');
+    const recipient = (to || process.env.REPORT_TO || '').trim();
+    if (!recipient) throw new Error('No recipient — pass one or set REPORT_TO in ⚙ API Keys');
+    const escHtml = (s) => s.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+    const res = await fetch('https://api.postmarkapp.com/email', {
+      method: 'POST',
+      headers: {
+        'X-Postmark-Server-Token': process.env.POSTMARK_TOKEN,
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: JSON.stringify({
+        From: from,
+        To: recipient,
+        Subject: subject,
+        TextBody: markdown,
+        HtmlBody: `<pre style="font-family:ui-monospace,Menlo,monospace;font-size:13px;white-space:pre-wrap">${escHtml(markdown)}</pre>`,
+        MessageStream: 'outbound',
+      }),
+      signal: AbortSignal.timeout(15_000),
+    });
+    const j = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(`Postmark: ${j.Message || `HTTP ${res.status}`}`);
+    return { ok: true, to: recipient, messageId: j.MessageID };
+  },
+
   'GET /api/pending-status': async () => {
     const zones = await cloudflare.listZones();
     const pendingZones = zones.filter((z) => z.status !== 'active');

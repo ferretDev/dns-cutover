@@ -139,6 +139,9 @@
       </div>
       <div><label>Cloudflare API token</label><input id="cfg-CF_API_TOKEN" type="password" autocomplete="off"></div>
       <div><label>Cloudflare account ID</label><input id="cfg-CF_ACCOUNT_ID" autocomplete="off"></div>
+      <div><label>Postmark server token (for emailed reports)</label><input id="cfg-POSTMARK_TOKEN" type="password" autocomplete="off"></div>
+      <div><label>Report sender (verified Postmark signature)</label><input id="cfg-REPORT_FROM" autocomplete="off" placeholder="reports@yourdomain.com"></div>
+      <div><label>Default report recipient</label><input id="cfg-REPORT_TO" autocomplete="off" placeholder="you@yourdomain.com"></div>
     </div>
     <button class="primary" id="btn-save-cfg">Save keys</button>
     <button id="btn-test-cfg">Test connections</button>
@@ -204,6 +207,7 @@
     <button class="small" id="btn-scan">🔍 Scan visible</button>
     <button class="small" id="btn-diag">🩺 Diagnose visible</button>
     <button class="small" id="btn-report" title="Markdown report for selected (or visible) domains from current scan/probe/diagnostic data">📄 Report</button>
+    <button class="small" id="btn-email-report" title="Email the same report via Postmark (configure in ⚙ API Keys)">✉</button>
     <span class="spacer"></span>
     <input id="search" placeholder="filter…" style="background:var(--panel);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:4px 8px;font-family:var(--mono);font-size:12px;width:160px">
     <select id="filter-status" style="background:var(--panel);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:4px 6px;font-size:12px">
@@ -245,6 +249,8 @@ const state = {
   diag: {}, hostprobe: {},
   pbMax: Number(localStorage.getItem('pbMax') || 20),
   queueRunning: false,
+  pbEmail: localStorage.getItem('pbEmail') === 'on',
+  reportTo: '', emailReady: false,
   playbooks: {},
   pbSelected: localStorage.getItem('pbSelected') || 'Full migration',
   pbLogText: [],
@@ -301,6 +307,7 @@ function renderDash() {
       </select>
       <span style="display:flex;gap:6px;align-items:center">
         <button class="small" id="btn-playbook" style="flex:1">▶ Run playbook on selected</button>
+        <label style="font-size:11px;color:var(--dim);white-space:nowrap" title="Email report + run log via Postmark when a playbook or queue run finishes"><input type="checkbox" id="pb-email" ${state.pbEmail ? 'checked' : ''}> ✉ on finish</label>
       </span>
       <span style="display:flex;gap:6px;align-items:center">
         ${state.queueRunning
@@ -329,6 +336,11 @@ function renderDash() {
   $('#pb-select').onchange = (e) => {
     state.pbSelected = e.target.value;
     localStorage.setItem('pbSelected', state.pbSelected);
+  };
+  $('#pb-email').onchange = (e) => {
+    state.pbEmail = e.target.checked;
+    localStorage.setItem('pbEmail', state.pbEmail ? 'on' : 'off');
+    if (state.pbEmail && !state.emailReady) toast('Heads up: Postmark token / sender not configured yet (⚙ API Keys).', 'err');
   };
   $('#btn-queue').onclick = () => {
     if (state.queueRunning) {
@@ -416,6 +428,7 @@ async function runPlaybookBulk() {
   }
   pbLog('<div style="margin-top:8px;color:var(--green)">■ playbook run complete</div>');
   btn.disabled = false;
+  autoEmailRun('playbook', targets);
 }
 
 /* ---------- windowed queue: respect Cloudflare's pending-zone cap ---------- */
@@ -476,6 +489,7 @@ async function runQueuePlaybook() {
   state.queueRunning = false;
   renderDash();
   refreshDomains(true);
+  if (processed) autoEmailRun('queue', targets);
 }
 
 async function bulkCreateSync(targets) {
@@ -601,15 +615,17 @@ async function api(path, opts = {}) {
 
 /* ---------- settings ---------- */
 
-const CFG_KEYS = ['ENOM_UID', 'ENOM_PW', 'ENOM_ENV', 'CF_API_TOKEN', 'CF_ACCOUNT_ID'];
+const CFG_KEYS = ['ENOM_UID', 'ENOM_PW', 'ENOM_ENV', 'CF_API_TOKEN', 'CF_ACCOUNT_ID', 'POSTMARK_TOKEN', 'REPORT_FROM', 'REPORT_TO'];
 
 async function loadSettings() {
   const cfg = await api('/api/config');
   for (const k of CFG_KEYS) {
     const input = $('#cfg-' + k);
     if (k === 'ENOM_ENV') input.value = cfg[k] || 'prod';
-    else input.placeholder = cfg[k] ? `current: ${cfg[k]}` : '(not set)';
+    else input.placeholder = cfg[k] ? `current: ${cfg[k]}` : (input.placeholder || '(not set)');
   }
+  state.reportTo = cfg.REPORT_TO || '';
+  state.emailReady = !!(cfg.POSTMARK_TOKEN && cfg.REPORT_FROM);
 }
 
 $('#btn-settings').onclick = () => $('#settings').classList.toggle('open');
@@ -837,6 +853,7 @@ function renderDetail(card, d) {
       <button class="small act-probe-hosts" ${d.zone ? '' : 'disabled'} title="Probe every hostname in this zone">🔦 probe hosts</button>
       <button class="small act-diag" ${d.zone ? '' : 'disabled'} title="Deep site diagnostic (redirects, headers, indexability, content sanity)">🩺 diagnose</button>
       <button class="small act-report" title="Download a Markdown report for this domain">📄</button>
+      <button class="small act-email-report" title="Email this domain's report via Postmark">✉</button>
       <button class="small act-reload">↻</button>
       <span style="color:var(--dim);font-size:12px">${counts.same} same · ${counts['enom-only']} missing in CF · ${counts['cf-only']} CF-only</span>
     </div>
@@ -1070,6 +1087,11 @@ function renderDetail(card, d) {
     toast(`Report downloaded for ${domain}.`, 'ok');
   };
 
+  $('.act-email-report', el).onclick = () => {
+    const date = new Date().toISOString().slice(0, 10);
+    emailMd(`DNS report — ${domain} — ${date}`, `# ${domain} — DNS report ${date}\n\n${mdForDomain(domain)}\n`);
+  };
+
   $('.act-reload', el).onclick = reload;
 }
 
@@ -1282,10 +1304,7 @@ function mdForDomain(domain) {
   return L.join('\n');
 }
 
-function bulkReport() {
-  const sel = $$('.sel-domain:checked').map((cb) => cb.dataset.domain);
-  const targets = sel.length ? sel : visibleDomains().map((d) => d.domain);
-  if (!targets.length) { toast('Nothing to report on.', 'err'); return; }
+function composeBulkMd(targets) {
   const now = new Date();
   const date = now.toISOString().slice(0, 10);
   const buckets = { none: 0, pending: 0, active: 0 };
@@ -1306,10 +1325,55 @@ function bulkReport() {
     '',
   ].filter((l) => l !== '');
   const body = targets.map(mdForDomain).join('\n\n');
-  downloadText(`dns-report-${date}.md`, `${head.join('\n')}\n${body}\n`);
+  return { md: `${head.join('\n')}\n${body}\n`, date };
+}
+
+function reportTargets() {
+  const sel = $$('.sel-domain:checked').map((cb) => cb.dataset.domain);
+  return sel.length ? sel : visibleDomains().map((d) => d.domain);
+}
+
+function bulkReport() {
+  const targets = reportTargets();
+  if (!targets.length) { toast('Nothing to report on.', 'err'); return; }
+  const { md, date } = composeBulkMd(targets);
+  downloadText(`dns-report-${date}.md`, md);
   toast(`Report generated for ${targets.length} domain(s).`, 'ok');
 }
 $('#btn-report').onclick = bulkReport;
+
+async function emailMd(subject, md, { promptTo = true } = {}) {
+  let to = state.reportTo || '';
+  if (promptTo) {
+    to = prompt('Email report to:', to) || '';
+    if (!to.trim()) return;
+  }
+  try {
+    const r = await api('/api/email-report', { body: { subject, markdown: md, to: to.trim() || undefined } });
+    toast(`Report emailed to ${r.to}.`, 'ok');
+  } catch (err) { toast(err.message, 'err'); }
+}
+
+$('#btn-email-report').onclick = () => {
+  const targets = reportTargets();
+  if (!targets.length) { toast('Nothing to report on.', 'err'); return; }
+  const { md, date } = composeBulkMd(targets);
+  emailMd(`DNS migration report — ${targets.length} domain(s) — ${date}`, md);
+};
+
+/** Auto-email after playbook/queue runs: report for the targets + the run log. */
+function autoEmailRun(kind, targets) {
+  if (!state.pbEmail) return;
+  const { md, date } = composeBulkMd(targets);
+  const log = state.pbLogText.join('\n');
+  api('/api/email-report', {
+    body: {
+      subject: `dns-cutover ${kind} report — ${targets.length} domain(s) — ${date}`,
+      markdown: `${md}\n\n## Run log\n\n\`\`\`\n${log}\n\`\`\`\n`,
+    },
+  }).then((r) => toast(`${kind} report emailed to ${r.to}.`, 'ok'))
+    .catch((err) => toast(`Auto-email failed: ${err.message}`, 'err'));
+}
 
 /* ---------- diagnostic sweeper ---------- */
 
