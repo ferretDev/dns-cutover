@@ -1,5 +1,15 @@
 # dns-cutover — Feature Roadmap
 
+> **Status 2026-07-30:** built since this was written — fleet uptime board (interval
+> probe, tiles/chips/dots, per-hostname probes: partial 1.2), diagnostic sweeper
+> (partial 1.1's checks, on-demand), missing-@/www detector-fixer + playbook `apex`
+> step, named playbooks + editor, exportable run logs, MD reports (bulk/per-domain),
+> triage report (grouped flags + actions), Postmark email + auto-email post-run.
+> **Top open items, in build order:** registrar-transfer tracker (3.3 — the imminent
+> phase), ops journal (1.4), post-cutover `confirm` playbook step (rest of 1.1),
+> server-side queue persistence (1.3), unattended scheduled triage email, dead-IP
+> registry (2.2), deep mail validation (2.3 — 13 domains now sit at p=none).
+
 Where the tool is: diff/sync engine, named playbooks + windowed queue, scan pills +
 dashboard, corrective tools (un-proxy, DMARC fixer, shared-IP + source-truth audits),
 redirect migration, EPP requests, NS rollback, mail-provider intelligence, identity guards.
