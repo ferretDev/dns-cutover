@@ -148,6 +148,20 @@
 
   <section id="tools" style="display:none;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:16px;margin-bottom:16px">
     <div style="margin-bottom:18px">
+      <b>Playbook editor</b>
+      <div style="color:var(--dim);font-size:12px;margin:2px 0 8px">Playbooks define which steps a run performs. Built-ins can't be edited — select one, rename, and Save to create your own variant. Cutover always forces verification.</div>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">
+        <select id="pbe-select" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:5px 6px;font-size:12px"></select>
+        <input id="pbe-name" placeholder="playbook name" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:5px 8px;font-family:var(--mono);font-size:12px;width:220px">
+        <button class="small primary" id="pbe-save">Save</button>
+        <button class="small danger" id="pbe-delete">Delete</button>
+      </div>
+      <div id="pbe-steps" style="display:flex;gap:14px;flex-wrap:wrap;font-size:12px"></div>
+      <div style="margin-top:8px;font-size:12px;color:var(--dim)">un-proxy patterns:
+        <input id="pbe-patterns" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:4px 8px;font-family:var(--mono);font-size:12px;width:300px" placeholder="pm-bounces, _domainkey, dkim">
+      </div>
+    </div>
+    <div style="margin-bottom:18px">
       <b>Un-proxy records by pattern</b>
       <div style="color:var(--dim);font-size:12px;margin:2px 0 8px">Finds proxied (orange-cloud) records whose name contains the pattern, across every Cloudflare zone, and flips them to DNS-only. Mail-infrastructure hostnames (pm-bounces, dkim, mail…) must not be proxied.</div>
       <input id="unproxy-pattern" value="pm-bounces" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:5px 8px;font-family:var(--mono);font-size:12px;width:200px">
@@ -207,10 +221,22 @@ const $ = (sel, el = document) => el.querySelector(sel);
 const $$ = (sel, el = document) => [...el.querySelectorAll(sel)];
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 const state = {
-  domains: [], detail: {}, scan: {}, chipFilter: null, pbCutover: true,
+  domains: [], detail: {}, scan: {}, chipFilter: null,
   pbMax: Number(localStorage.getItem('pbMax') || 20),
   queueRunning: false,
+  playbooks: {},
+  pbSelected: localStorage.getItem('pbSelected') || 'Full migration',
+  pbLogText: [],
 };
+
+function currentPlaybook() {
+  return state.playbooks[state.pbSelected] || state.playbooks['Full migration'] || { steps: {}, unproxyPatterns: [] };
+}
+
+const PB_STEP_ORDER = ['zone', 'records', 'redirects', 'dmarc', 'unproxy', 'verify', 'cutover'];
+function stepsSummary(cfg) {
+  return PB_STEP_ORDER.filter((k) => (cfg.steps || {})[k] !== false).join(' → ');
+}
 
 /* ---------- scan intelligence ---------- */
 
@@ -247,9 +273,11 @@ function renderDash() {
     `<div class="tools">
       <button class="small primary" id="btn-bulk-create" ${createTargets.length ? '' : 'disabled'}>⚡ Create &amp; sync ${selZoneless.length ? `selected (${selZoneless.length})` : `all zoneless (${zoneless.length})`}</button>
       <button class="small danger" id="btn-bulk-cutover" ${ready ? '' : 'disabled'}>🚀 Cut over ready (${scanned ? ready : 0})</button>
+      <select id="pb-select" title="Which playbook runs" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:4px 6px;font-size:12px">
+        ${Object.keys(state.playbooks).map((n) => `<option ${n === state.pbSelected ? 'selected' : ''}>${esc(n)}</option>`).join('') || '<option>Full migration</option>'}
+      </select>
       <span style="display:flex;gap:6px;align-items:center">
-        <button class="small" id="btn-playbook" style="flex:1">▶ Playbook selected</button>
-        <label style="font-size:11px;color:var(--dim);white-space:nowrap"><input type="checkbox" id="pb-cutover" ${state.pbCutover ? 'checked' : ''}> cut over</label>
+        <button class="small" id="btn-playbook" style="flex:1">▶ Run playbook on selected</button>
       </span>
       <span style="display:flex;gap:6px;align-items:center">
         ${state.queueRunning
@@ -275,7 +303,10 @@ function renderDash() {
   $('#btn-bulk-create').onclick = () => bulkCreateSync(createTargets);
   $('#btn-bulk-cutover').onclick = bulkCutover;
   $('#btn-playbook').onclick = runPlaybookBulk;
-  $('#pb-cutover').onchange = (e) => { state.pbCutover = e.target.checked; };
+  $('#pb-select').onchange = (e) => {
+    state.pbSelected = e.target.value;
+    localStorage.setItem('pbSelected', state.pbSelected);
+  };
   $('#btn-queue').onclick = () => {
     if (state.queueRunning) {
       state.queueRunning = false;
@@ -300,12 +331,33 @@ function pbLog(html) {
   el.style.display = 'block';
   el.insertAdjacentHTML('beforeend', html);
   el.scrollTop = el.scrollHeight;
+  const text = html.replace(/<[^>]+>/g, ' ').replace(/&gt;/g, '>').replace(/&lt;/g, '<').replace(/&amp;/g, '&').replace(/\s+/g, ' ').trim();
+  if (text) state.pbLogText.push(`[${new Date().toISOString()}] ${text}`);
 }
 
-async function playbookOne(d, doCut, label = '') {
+function pbLogReset() {
+  state.pbLogText = [];
+  $('#pb-log').innerHTML = `
+    <span style="float:right;display:flex;gap:6px">
+      <button class="small" onclick="pbExport()">⬇ export</button>
+      <button class="small" onclick="this.closest('#pb-log').style.display='none'">✕</button>
+    </span>`;
+}
+
+function pbExport() {
+  if (!state.pbLogText.length) { toast('Log is empty.', 'err'); return; }
+  const blob = new Blob([state.pbLogText.join('\n') + '\n'], { type: 'text/plain' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `playbook-log-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-')}.txt`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+async function playbookOne(d, config, label = '') {
   pbLog(`<div style="margin-top:8px"><b>▶ ${esc(d)}</b> <span style="color:var(--dim)">${label}</span></div>`);
   try {
-    const r = await api(`/api/domain/playbook?domain=${d}`, { body: { cutover: doCut } });
+    const r = await api(`/api/domain/playbook?domain=${d}`, { body: { config } });
     for (const st of r.steps) {
       pbLog(`<div style="padding-left:14px">${PB_ICONS[st.status] || st.status} <span style="color:var(--blue)">${esc(st.step)}</span> — ${esc(st.detail)}</div>`);
     }
@@ -327,15 +379,17 @@ async function playbookOne(d, doCut, label = '') {
 async function runPlaybookBulk() {
   const targets = $$('.sel-domain:checked').map((cb) => cb.dataset.domain);
   if (!targets.length) { toast('Select domains first (checkboxes), then run the playbook.', 'err'); return; }
-  const doCut = state.pbCutover;
-  if (!confirm(`Run playbook on ${targets.length} domain(s), one at a time?\n\nSteps: ensure zone → sync records → migrate redirects → fix misplaced DMARC → un-proxy mail hosts → verify${doCut ? ' → CUT OVER NS (verify-gated, rollback saved)' : ''}.`)) return;
-  $('#pb-log').innerHTML = '<button class="small" style="float:right" onclick="this.parentElement.style.display=\'none\'">✕</button>';
+  const config = currentPlaybook();
+  const hasCutover = (config.steps || {}).cutover !== false;
+  if (!confirm(`Run playbook "${state.pbSelected}" on ${targets.length} domain(s), one at a time?\n\nSteps: ${stepsSummary(config)}${hasCutover ? '\n(cutover is verify-gated, rollback saved)' : ''}`)) return;
+  pbLogReset();
   const btn = $('#btn-playbook');
   btn.disabled = true;
+  pbLog(`<div><b>▶ Playbook "${esc(state.pbSelected)}"</b> — ${targets.length} domain(s) — ${esc(stepsSummary(config))}</div>`);
   let n = 0;
   for (const d of targets) {
     n++;
-    await playbookOne(d, doCut, `(${n}/${targets.length})`);
+    await playbookOne(d, config, `(${n}/${targets.length})`);
   }
   pbLog('<div style="margin-top:8px;color:var(--green)">■ playbook run complete</div>');
   btn.disabled = false;
@@ -352,13 +406,18 @@ async function qSleep(ms) {
 async function runQueuePlaybook() {
   const targets = $$('.sel-domain:checked').map((cb) => cb.dataset.domain);
   if (!targets.length) { toast('Select domains to queue first (checkboxes).', 'err'); return; }
-  if (!confirm(`Queue ${targets.length} domain(s) through the full playbook, keeping at most ${state.pbMax} zones awaiting NS activation?\n\nDomains are admitted only while account-wide pending zones < ${state.pbMax} — the window auto-shrinks if anything else is pending. As zones activate, the queue advances. Cutover is ON (activation requires it). Keep this tab open.`)) return;
+  const config = currentPlaybook();
+  if ((config.steps || {}).cutover === false) {
+    toast(`Playbook "${state.pbSelected}" has cutover disabled — the queue window can never drain. Pick a cutover playbook (e.g. Full migration) or use ▶ Run instead.`, 'err');
+    return;
+  }
+  if (!confirm(`Queue ${targets.length} domain(s) through playbook "${state.pbSelected}", keeping at most ${state.pbMax} zones awaiting NS activation?\n\nSteps: ${stepsSummary(config)}\n\nDomains are admitted only while account-wide pending zones < ${state.pbMax} — the window auto-shrinks if anything else is pending. As zones activate, the queue advances. Keep this tab open.`)) return;
   state.queueRunning = true;
   renderDash();
-  $('#pb-log').innerHTML = '<button class="small" style="float:right" onclick="this.parentElement.style.display=\'none\'">✕</button>';
+  pbLogReset();
   const queue = [...targets];
   let processed = 0;
-  pbLog(`<div><b>🎛 Queue started</b> — ${queue.length} domain(s), window ≤${state.pbMax} pending</div>`);
+  pbLog(`<div><b>🎛 Queue started</b> — playbook "${esc(state.pbSelected)}", ${queue.length} domain(s), window ≤${state.pbMax} pending</div>`);
   while (queue.length && state.queueRunning) {
     let pending;
     try {
@@ -380,7 +439,7 @@ async function runQueuePlaybook() {
     for (const d of batch) {
       if (!state.queueRunning) { queue.unshift(d); break; }
       processed++;
-      await playbookOne(d, true, `(queue ${processed}/${targets.length})`);
+      await playbookOne(d, config, `(queue ${processed}/${targets.length})`);
     }
     if (queue.length && state.queueRunning) {
       pbLog('<div style="color:var(--dim)">waiting for activations to free window slots (3 min)…</div>');
@@ -960,6 +1019,58 @@ function toggleDetail(card) {
 $('#btn-tools').onclick = () => {
   const t = $('#tools');
   t.style.display = t.style.display === 'none' ? 'block' : 'none';
+  if (t.style.display === 'block') renderPbEditor();
+};
+
+/* ---------- playbook editor ---------- */
+
+const PBE_STEPS = [
+  ['zone', 'ensure zone'], ['records', 'sync records'], ['redirects', 'migrate redirects'],
+  ['dmarc', 'fix DMARC'], ['unproxy', 'un-proxy mail hosts'], ['verify', 'verify'], ['cutover', 'cut over NS'],
+];
+
+function renderPbEditor(selectName) {
+  const sel = $('#pbe-select');
+  const names = Object.keys(state.playbooks);
+  const current = selectName || sel.value || state.pbSelected;
+  sel.innerHTML = names.map((n) => `<option ${n === current ? 'selected' : ''}>${esc(n)}</option>`).join('');
+  const cfg = state.playbooks[sel.value] || { steps: {}, unproxyPatterns: [] };
+  $('#pbe-name').value = sel.value || '';
+  $('#pbe-patterns').value = (cfg.unproxyPatterns || []).join(', ');
+  $('#pbe-steps').innerHTML = PBE_STEPS.map(([key, label]) =>
+    `<label style="display:flex;gap:4px;align-items:center"><input type="checkbox" class="pbe-step" data-step="${key}" ${(cfg.steps || {})[key] !== false ? 'checked' : ''}> ${label}</label>`).join('');
+  $('#pbe-delete').disabled = !!cfg.builtin;
+  sel.onchange = () => renderPbEditor(sel.value);
+}
+
+$('#pbe-save').onclick = async () => {
+  const name = $('#pbe-name').value.trim();
+  if (!name) { toast('Give the playbook a name.', 'err'); return; }
+  const steps = {};
+  $$('.pbe-step').forEach((cb) => { steps[cb.dataset.step] = cb.checked; });
+  const unproxyPatterns = $('#pbe-patterns').value.split(',').map((s) => s.trim()).filter(Boolean);
+  try {
+    const { playbooks } = await api('/api/playbooks', { body: { name, config: { steps, unproxyPatterns } } });
+    state.playbooks = playbooks;
+    state.pbSelected = name;
+    localStorage.setItem('pbSelected', name);
+    renderPbEditor(name);
+    renderDash();
+    toast(`Playbook "${name}" saved.`, 'ok');
+  } catch (err) { toast(err.message, 'err'); }
+};
+
+$('#pbe-delete').onclick = async () => {
+  const name = $('#pbe-select').value;
+  if (!confirm(`Delete playbook "${name}"?`)) return;
+  try {
+    const { playbooks } = await api('/api/playbooks/delete', { body: { name } });
+    state.playbooks = playbooks;
+    if (!playbooks[state.pbSelected]) { state.pbSelected = 'Full migration'; localStorage.setItem('pbSelected', state.pbSelected); }
+    renderPbEditor(state.pbSelected);
+    renderDash();
+    toast(`Playbook "${name}" deleted.`, 'ok');
+  } catch (err) { toast(err.message, 'err'); }
 };
 
 function toolResultsTable(container, rows, cols, actionLabel, onApply) {
@@ -1072,6 +1183,10 @@ $('#btn-find-dmarc').onclick = async () => {
   const cfg = await api('/api/config').catch(() => ({}));
   const configured = cfg.ENOM_UID && cfg.CF_API_TOKEN;
   if (!configured) $('#settings').classList.add('open');
+  try {
+    ({ playbooks: state.playbooks } = await api('/api/playbooks'));
+    if (!state.playbooks[state.pbSelected]) state.pbSelected = 'Full migration';
+  } catch { /* selector falls back to Full migration */ }
   await refreshDomains();
   // Auto-populate pills after load; rows fill in progressively as chunks return.
   if (configured && state.domains.length) runScan(state.domains.map((d) => d.domain));

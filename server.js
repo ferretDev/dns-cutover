@@ -15,6 +15,7 @@ import {
 } from './lib/records.js';
 import { analyzeMail } from './lib/mailcheck.js';
 import { getRollbacks, saveRollback, markRolledBack } from './lib/rollback.js';
+import { getPlaybooks, savePlaybook, deletePlaybook } from './lib/playbooks.js';
 
 const root = dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 8899);
@@ -183,7 +184,12 @@ async function syncRecords(domain, direction, keys) {
 // Hostnames that must never be proxied — pure-DNS mail infrastructure.
 const NOPROXY_PATTERNS = ['pm-bounces', '_domainkey', 'dkim'];
 
-async function runPlaybook(domain, { cutover = true } = {}) {
+async function runPlaybook(domain, config = {}) {
+  const cfg = {
+    zone: true, records: true, redirects: true, dmarc: true, unproxy: true, verify: true, cutover: true,
+    ...(config.steps || {}),
+  };
+  const patterns = config.unproxyPatterns?.length ? config.unproxyPatterns : NOPROXY_PATTERNS;
   const steps = [];
   const add = (step, status, detail = '') => steps.push({ step, status, detail });
   let s;
@@ -191,7 +197,9 @@ async function runPlaybook(domain, { cutover = true } = {}) {
     // 1. zone
     s = await domainState(domain);
     let zoneId = s.zone?.id;
-    if (zoneId) {
+    if (!cfg.zone) {
+      add('zone', 'skip', 'disabled by playbook');
+    } else if (zoneId) {
       add('zone', 'skip', `exists (${s.zone.status})`);
     } else {
       const z = assertZone(await cloudflare.createZone(domain), domain);
@@ -201,7 +209,9 @@ async function runPlaybook(domain, { cutover = true } = {}) {
 
     // 2. records
     const missingBefore = s.rows.filter((r) => r.status === 'enom-only').length;
-    if (!missingBefore && s.zone) {
+    if (!cfg.records) {
+      add('records', 'skip', 'disabled by playbook');
+    } else if (!missingBefore && s.zone) {
       add('records', 'skip', 'nothing missing');
     } else {
       const results = await syncRecords(domain, 'to-cf', null);
@@ -217,7 +227,11 @@ async function runPlaybook(domain, { cutover = true } = {}) {
 
     // 3. redirects
     const uncovered = (s.redirects || []).filter((r) => !r.covered);
-    if (!uncovered.length) {
+    if (!cfg.redirects) {
+      add('redirects', 'skip', 'disabled by playbook');
+    } else if (!zoneId) {
+      add('redirects', 'skip', 'no zone');
+    } else if (!uncovered.length) {
       add('redirects', 'skip', s.redirects?.length ? 'all covered' : 'none needed');
     } else {
       const raw = await cloudflare.listRecords(zoneId);
@@ -239,7 +253,11 @@ async function runPlaybook(domain, { cutover = true } = {}) {
     }
 
     // 4. misplaced DMARC
-    if (s.mail?.misplacedDmarc) {
+    if (!cfg.dmarc) {
+      add('dmarc', 'skip', 'disabled by playbook');
+    } else if (!zoneId) {
+      add('dmarc', 'skip', 'no zone');
+    } else if (s.mail?.misplacedDmarc) {
       await cloudflare.createRecord(zoneId, toCloudflarePayload({
         type: 'TXT', name: `_dmarc.${domain}`, content: s.mail.misplacedDmarc.content,
       }));
@@ -249,23 +267,33 @@ async function runPlaybook(domain, { cutover = true } = {}) {
     }
 
     // 5. un-proxy mail hostnames
-    const rawRecs = await cloudflare.listRecords(zoneId);
-    const badProxy = rawRecs.filter((r) => r.proxied && NOPROXY_PATTERNS.some((p) => r.name.toLowerCase().includes(p)));
-    if (!badProxy.length) {
-      add('unproxy', 'skip', 'no proxied mail hostnames');
+    if (!cfg.unproxy) {
+      add('unproxy', 'skip', 'disabled by playbook');
+    } else if (!zoneId) {
+      add('unproxy', 'skip', 'no zone');
     } else {
-      for (const r of badProxy) await cloudflare.updateRecord(zoneId, r.id, { proxied: false });
-      add('unproxy', 'ok', `${badProxy.length} flipped to DNS-only (${badProxy.map((b) => b.name).join(', ')})`);
+      const rawRecs = await cloudflare.listRecords(zoneId);
+      const badProxy = rawRecs.filter((r) => r.proxied && patterns.some((p) => r.name.toLowerCase().includes(p)));
+      if (!badProxy.length) {
+        add('unproxy', 'skip', 'no proxied mail hostnames');
+      } else {
+        for (const r of badProxy) await cloudflare.updateRecord(zoneId, r.id, { proxied: false });
+        add('unproxy', 'ok', `${badProxy.length} flipped to DNS-only (${badProxy.map((b) => b.name).join(', ')})`);
+      }
     }
 
-    // 6. verify
+    // 6. verify (forced whenever cutover is enabled — cutover requires it)
+    const wantVerify = cfg.verify || cfg.cutover;
     s = await domainState(domain);
     const missing = s.rows.filter((r) => r.status === 'enom-only').length;
     const matched = s.rows.filter((r) => r.status === 'same').length;
     const cfCount = s.rows.filter((r) => r.cf).length;
     const srvWarn = s.warnings.filter((w) => w.includes('SRV')).length;
     let verified;
-    if (missing > 0) {
+    if (!wantVerify) {
+      verified = false;
+      add('verify', 'skip', 'disabled by playbook');
+    } else if (missing > 0) {
       verified = false;
       add('verify', 'fail', `${missing} record(s) still missing in Cloudflare`);
     } else if (s.rows.length === 0) {
@@ -278,7 +306,7 @@ async function runPlaybook(domain, { cutover = true } = {}) {
       verified = true;
       add('verify', srvWarn ? 'warn' : 'ok', `all ${matched} records match${srvWarn ? ` (${srvWarn} broken SRV skipped — see warnings)` : ''}`);
     }
-    for (const c of s.mail?.contamination || []) {
+    for (const c of (wantVerify && s.mail?.contamination) || []) {
       if (c.inEnom) {
         add('verify', 'warn', `pre-existing at source: ${c.msg}`);
       } else {
@@ -288,7 +316,7 @@ async function runPlaybook(domain, { cutover = true } = {}) {
     }
 
     // 7. cutover
-    if (!cutover) add('cutover', 'skip', 'disabled for this run');
+    if (!cfg.cutover) add('cutover', 'skip', 'disabled by playbook');
     else if (s.pointedAtCf) add('cutover', 'skip', 'already pointed at Cloudflare');
     else if (!verified) add('cutover', 'blocked', 'verification failed');
     else if (!s.cfNs.length) add('cutover', 'blocked', 'Cloudflare has not assigned nameservers yet');
@@ -363,9 +391,30 @@ const routes = {
     return { checked: results.filter((r) => r?.ok).length, pending: pending.length };
   },
 
+  'GET /api/playbooks': async () => ({ playbooks: getPlaybooks() }),
+
+  'POST /api/playbooks': async (req) => {
+    const { name, config } = await readBody(req);
+    if (!name?.trim()) throw new Error('Playbook name required');
+    savePlaybook(name.trim(), config || {});
+    return { playbooks: getPlaybooks() };
+  },
+
+  'POST /api/playbooks/delete': async (req) => {
+    const { name } = await readBody(req);
+    deletePlaybook(name);
+    return { playbooks: getPlaybooks() };
+  },
+
   'POST /api/domain/playbook': async (req, res, domain) => {
-    const { cutover = true } = await readBody(req);
-    return runPlaybook(domain, { cutover });
+    const body = await readBody(req);
+    let config = body.config;
+    if (!config && body.playbook) {
+      config = getPlaybooks()[body.playbook];
+      if (!config) throw new Error(`Unknown playbook "${body.playbook}"`);
+    }
+    if (!config) config = { steps: { cutover: body.cutover !== false } }; // legacy shape
+    return runPlaybook(domain, config);
   },
 
   'POST /api/domain/create-zone': async (req, res, domain) => {
