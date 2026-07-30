@@ -357,7 +357,7 @@ const NOPROXY_PATTERNS = ['pm-bounces', '_domainkey', 'dkim'];
 
 async function runPlaybook(domain, config = {}) {
   const cfg = {
-    zone: true, records: true, redirects: true, dmarc: true, unproxy: true, verify: true, cutover: true,
+    zone: true, records: true, apex: true, redirects: true, dmarc: true, unproxy: true, verify: true, cutover: true,
     ...(config.steps || {}),
   };
   const patterns = config.unproxyPatterns?.length ? config.unproxyPatterns : NOPROXY_PATTERNS;
@@ -396,7 +396,39 @@ async function runPlaybook(domain, config = {}) {
     s = await domainState(domain);
     zoneId = s.zone?.id;
 
-    // 3. redirects
+    // 3. core address records — a * wildcard does NOT cover the apex
+    if (!cfg.apex) {
+      add('apex', 'skip', 'disabled by playbook');
+    } else if (!zoneId) {
+      add('apex', 'skip', 'no zone');
+    } else {
+      const rawA = await cloudflare.listRecords(zoneId);
+      const addr = rawA.filter((r) => ['A', 'AAAA', 'CNAME'].includes(r.type));
+      const apexRec = addr.find((r) => r.name.toLowerCase() === domain);
+      const wildcard = addr.find((r) => r.name.toLowerCase() === `*.${domain}`);
+      const wwwRec = addr.find((r) => r.name.toLowerCase() === `www.${domain}`);
+      const made = [];
+      let apexSrc = apexRec;
+      if (!apexRec) {
+        const src = wildcard || wwwRec;
+        if (src) {
+          await cloudflare.createRecord(zoneId, { type: src.type, name: domain, content: src.content, ttl: 1, proxied: !!src.proxied });
+          made.push(`@ ← ${wildcard ? '*' : 'www'} (${src.type} ${src.content})`);
+          apexSrc = src;
+        } else {
+          const cands = [...new Set(addr.map((r) => r.content))].slice(0, 3);
+          add('apex', 'warn', `no @ address record and no */www to mirror${cands.length ? ` — clone candidates: ${cands.join(', ')}` : ' (no address records at all)'}`);
+        }
+      }
+      if (!wwwRec && !wildcard && apexSrc) {
+        await cloudflare.createRecord(zoneId, { type: apexSrc.type, name: `www.${domain}`, content: apexSrc.content, ttl: 1, proxied: !!apexSrc.proxied });
+        made.push(`www ← @ (${apexSrc.type} ${apexSrc.content})`);
+      }
+      if (made.length) add('apex', 'ok', made.join('; '));
+      else if (apexRec && (wwwRec || wildcard)) add('apex', 'skip', '@ and www covered');
+    }
+
+    // 4. redirects
     const uncovered = (s.redirects || []).filter((r) => !r.covered);
     if (!cfg.redirects) {
       add('redirects', 'skip', 'disabled by playbook');
@@ -712,6 +744,65 @@ const routes = {
   },
 
   /* ---- bulk corrective tools: operate across ALL Cloudflare zones ---- */
+
+  'POST /api/tools/find-missing-apex': async () => {
+    const zones = await cloudflare.listZones();
+    const fixable = [];
+    const unfixable = [];
+    await pooled(zones, 6, async (z) => {
+      const recs = await cloudflare.listRecords(z.id);
+      const addr = recs.filter((r) => ['A', 'AAAA', 'CNAME'].includes(r.type));
+      const apexRec = addr.find((r) => r.name.toLowerCase() === z.name);
+      const wildcard = addr.find((r) => r.name.toLowerCase() === `*.${z.name}`);
+      const wwwRec = addr.find((r) => r.name.toLowerCase() === `www.${z.name}`);
+
+      if (!apexRec) {
+        const src = wildcard || wwwRec; // wildcard does NOT cover apex — that's the bug
+        if (src) {
+          // Probe www: it's served by the explicit www record or covered by the wildcard,
+          // so it exercises exactly the value we'd mirror to @.
+          const live = await probeHost(`www.${z.name}`).catch(() => ({ class: 'dead' }));
+          fixable.push({
+            domain: z.name, zoneId: z.id, target: '@', from: wildcard ? '*' : 'www',
+            type: src.type, content: src.content, proxied: !!src.proxied,
+            sourceLive: `${live.class}${live.status ? ' ' + live.status : ''}`,
+          });
+        } else {
+          const cands = [...new Set(addr.map((r) => `${r.content} (${r.name.toLowerCase().replace(`.${z.name}`, '')})`))].slice(0, 4);
+          unfixable.push({
+            domain: z.name,
+            note: cands.length ? `no @ / * / www — clone candidates: ${cands.join(', ')}` : 'no address records at all (mail-only/parked?)',
+          });
+        }
+      }
+
+      // www only counts as missing when no wildcard covers it
+      if (!wwwRec && !wildcard && apexRec) {
+        const live = await probeHost(z.name).catch(() => ({ class: 'dead' }));
+        fixable.push({
+          domain: z.name, zoneId: z.id, target: 'www', from: '@',
+          type: apexRec.type, content: apexRec.content, proxied: !!apexRec.proxied,
+          sourceLive: `${live.class}${live.status ? ' ' + live.status : ''}`,
+        });
+      }
+    });
+    fixable.sort((a, b) => a.domain.localeCompare(b.domain) || a.target.localeCompare(b.target));
+    unfixable.sort((a, b) => a.domain.localeCompare(b.domain));
+    return { fixable, unfixable, zonesScanned: zones.length };
+  },
+
+  'POST /api/tools/fix-apex': async (req) => {
+    const { items = [] } = await readBody(req);
+    const results = await pooled(items, 5, async (it) => {
+      const name = it.target === 'www' ? `www.${it.domain}` : it.domain;
+      assertBelongs(name, it.domain);
+      await cloudflare.createRecord(it.zoneId, {
+        type: it.type, name, content: it.content, ttl: 1, proxied: !!it.proxied,
+      });
+      return { domain: it.domain, target: it.target, ok: true };
+    });
+    return { results };
+  },
 
   'POST /api/tools/find-proxied': async (req) => {
     const { pattern } = await readBody(req);

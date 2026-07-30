@@ -162,6 +162,12 @@
       </div>
     </div>
     <div style="margin-bottom:18px">
+      <b>Missing @ / www records</b>
+      <div style="color:var(--dim);font-size:12px;margin:2px 0 8px">A <code>*</code> wildcard does NOT cover the apex — a zone with only <code>*</code> leaves <code>@</code> unresolvable. Finds zones missing <code>@</code> (mirror from <code>*</code>, else <code>www</code>) or missing <code>www</code> with no wildcard (mirror from <code>@</code>), probing the source first so you never clone a dead value. Zones with nothing to mirror get clone-candidate recommendations.</div>
+      <button class="small" id="btn-find-apex">Find missing @ / www</button>
+      <div id="apex-results" style="margin-top:8px"></div>
+    </div>
+    <div style="margin-bottom:18px">
       <b>Un-proxy records by pattern</b>
       <div style="color:var(--dim);font-size:12px;margin:2px 0 8px">Finds proxied (orange-cloud) records whose name contains the pattern, across every Cloudflare zone, and flips them to DNS-only. Mail-infrastructure hostnames (pm-bounces, dkim, mail…) must not be proxied.</div>
       <input id="unproxy-pattern" value="pm-bounces" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:5px 8px;font-family:var(--mono);font-size:12px;width:200px">
@@ -247,7 +253,7 @@ function currentPlaybook() {
   return state.playbooks[state.pbSelected] || state.playbooks['Full migration'] || { steps: {}, unproxyPatterns: [] };
 }
 
-const PB_STEP_ORDER = ['zone', 'records', 'redirects', 'dmarc', 'unproxy', 'verify', 'cutover'];
+const PB_STEP_ORDER = ['zone', 'records', 'apex', 'redirects', 'dmarc', 'unproxy', 'verify', 'cutover'];
 function stepsSummary(cfg) {
   return PB_STEP_ORDER.filter((k) => (cfg.steps || {})[k] !== false).join(' → ');
 }
@@ -1092,7 +1098,7 @@ $('#btn-tools').onclick = () => {
 /* ---------- playbook editor ---------- */
 
 const PBE_STEPS = [
-  ['zone', 'ensure zone'], ['records', 'sync records'], ['redirects', 'migrate redirects'],
+  ['zone', 'ensure zone'], ['records', 'sync records'], ['apex', 'fix @/www'], ['redirects', 'migrate redirects'],
   ['dmarc', 'fix DMARC'], ['unproxy', 'un-proxy mail hosts'], ['verify', 'verify'], ['cutover', 'cut over NS'],
 ];
 
@@ -1165,6 +1171,28 @@ function toolResultsTable(container, rows, cols, actionLabel, onApply) {
     await onApply(selected, container);
   };
 }
+
+$('#btn-find-apex').onclick = async () => {
+  const box = $('#apex-results');
+  box.innerHTML = '<span class="loading">Scanning all zones (probing mirror sources)…</span>';
+  try {
+    const { fixable, unfixable, zonesScanned } = await api('/api/tools/find-missing-apex', { body: {} });
+    toast(`Scanned ${zonesScanned} zones — ${fixable.length} fixable, ${unfixable.length} needing a manual decision.`);
+    toolResultsTable(box, fixable,
+      [{ key: 'domain', label: 'Domain' }, { key: 'target', label: 'Missing' }, { key: 'from', label: 'Mirror from' }, { key: 'type', label: 'Type' }, { key: 'content', label: 'Value' }, { key: 'sourceLive', label: 'Source health' }],
+      '@ Create selected',
+      async (selected) => {
+        const { results } = await api('/api/tools/fix-apex', { body: { items: selected } });
+        const bad = results.filter((r) => !r || r.error || r.ok === false);
+        bad.length ? toast(`${bad.length} failed: ${bad[0].error || ''}`, 'err') : toast(`${results.length} record(s) created.`, 'ok');
+        $('#btn-find-apex').click();
+      });
+    if (unfixable.length) {
+      box.insertAdjacentHTML('beforeend',
+        `<div style="color:var(--amber);font-size:12px;margin-top:8px">Manual decision needed:<br>${unfixable.map((u) => `&nbsp;&nbsp;${esc(u.domain)} <span style="color:var(--dim)">— ${esc(u.note)}</span>`).join('<br>')}</div>`);
+    }
+  } catch (err) { box.innerHTML = `<div class="errors">✗ ${esc(err.message)}</div>`; }
+};
 
 $('#btn-find-proxied').onclick = async () => {
   const pattern = $('#unproxy-pattern').value.trim();
