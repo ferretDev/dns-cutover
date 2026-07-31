@@ -771,6 +771,29 @@ const routes = {
     return { steps, state: await domainState(domain) };
   },
 
+  'POST /api/domain/record-update': async (req, res, domain) => {
+    const { recordId, type, content, priority, proxied } = await readBody(req);
+    if (!recordId) throw new Error('recordId required');
+    const zone = assertZone(await cloudflare.getZone(domain), domain);
+    if (!zone) throw new Error('No Cloudflare zone.');
+    const fields = {};
+    if (content !== undefined && content !== '') {
+      if (type === 'TXT' && !/^".*"$/.test(content)) {
+        fields.content = `"${content}"`;
+      } else if (type === 'SRV') {
+        const [weight, port, ...target] = content.trim().split(/\s+/);
+        fields.data = { weight: Number(weight) || 0, port: Number(port) || 0, target: target.join(''), priority: Number(priority) || 0 };
+      } else {
+        fields.content = content;
+      }
+    }
+    if (priority !== undefined && type === 'MX') fields.priority = Number(priority);
+    if (proxied !== undefined && ['A', 'AAAA', 'CNAME'].includes(type)) fields.proxied = !!proxied;
+    if (!Object.keys(fields).length) throw new Error('Nothing to update');
+    const updated = await cloudflare.updateRecord(zone.id, recordId, fields);
+    return { ok: true, record: { type: updated.type, name: updated.name, content: updated.content, proxied: updated.proxied, priority: updated.priority } };
+  },
+
   'POST /api/domain/mirror-dmarc': async (req, res, domain) => {
     const state = await domainState(domain);
     if (!state.zone) throw new Error('No Cloudflare zone — sync first.');

@@ -836,7 +836,8 @@ $('#btn-batch-sync').onclick = async () => {
 function recCell(rec) {
   if (!rec) return '<td class="cell gap">—</td>';
   const prio = rec.type === 'MX' ? ` <b>${rec.priority}</b>` : '';
-  return `<td class="cell cell-${rec._side}"><span class="rectype">${esc(rec.type)}</span> <span class="recname">${esc(rec.name)}</span> →${prio} <span class="reccontent">${esc(rec.content)}</span></td>`;
+  const cloud = rec._side === 'cf' && rec.proxied ? ' <span title="proxied (orange cloud)" style="color:var(--amber)">☁</span>' : '';
+  return `<td class="cell cell-${rec._side}"><span class="rectype">${esc(rec.type)}</span> <span class="recname">${esc(rec.name)}</span> →${prio} <span class="reccontent">${esc(rec.content)}</span>${cloud}</td>`;
 }
 
 function renderDetail(card, d) {
@@ -890,11 +891,12 @@ function renderDetail(card, d) {
           const enom = r.enom ? { ...r.enom, _side: 'enom' } : null;
           const cf = r.cf ? { ...r.cf, _side: 'cf' } : null;
           const stat = r.status === 'same' ? '✓' : r.status === 'enom-only' ? '✗' : '±';
-          const act = r.status === 'enom-only'
+          const editBtn = r.cf?.id ? `<button class="small act-edit" data-key="${esc(r.key)}" title="Edit this Cloudflare record inline">✎</button>` : '';
+          const act = (r.status === 'enom-only'
             ? `<button class="small act-row" data-key="${esc(r.key)}" data-dir="to-cf" title="Copy to Cloudflare">→</button>`
             : r.status === 'cf-only'
               ? `<button class="small act-row" data-key="${esc(r.key)}" data-dir="to-enom" title="Copy to Enom">←</button>`
-              : '';
+              : '') + editBtn;
           const sel = r.status === 'same' ? '' : `<input type="checkbox" class="sel-row" data-key="${esc(r.key)}" data-dir="${r.status === 'enom-only' ? 'to-cf' : 'to-enom'}">`;
           return `<tr class="${r.status}"><td class="sel">${sel}</td>${recCell(enom)}<td class="stat">${stat}</td>${recCell(cf)}<td class="act">${act}</td></tr>`;
         }).join('')}
@@ -942,6 +944,42 @@ function renderDetail(card, d) {
 
   $$('.sel-row', el).forEach((cb) => {
     cb.onchange = () => { $('.act-sync-sel', el).disabled = !$$('.sel-row:checked', el).length; };
+  });
+
+  $$('.act-edit', el).forEach((btn) => {
+    btn.onclick = () => {
+      const row = d.rows.find((x) => x.key === btn.dataset.key);
+      if (!row?.cf?.id) return;
+      const rec = row.cf;
+      const cfCell = btn.closest('tr').querySelector('td.cell-cf');
+      if (!cfCell) return;
+      const inputStyle = 'background:var(--panel);border:1px solid var(--blue);border-radius:4px;color:var(--text);padding:2px 6px;font-family:var(--mono);font-size:12px';
+      cfCell.innerHTML = `
+        <span class="rectype">${esc(rec.type)}</span> <span class="recname">${esc(rec.name)}</span> →
+        ${rec.type === 'MX' ? `<input class="ed-prio" type="number" value="${rec.priority ?? 10}" style="${inputStyle};width:54px" title="priority">` : ''}
+        <input class="ed-content" value="${esc(rec.content)}" style="${inputStyle};width:55%" title="${rec.type === 'SRV' ? 'weight port target' : 'content'}">
+        ${['A', 'AAAA', 'CNAME'].includes(rec.type) ? `<label style="font-size:11px;white-space:nowrap" title="proxied (orange cloud)"><input type="checkbox" class="ed-prox" ${rec.proxied ? 'checked' : ''}>☁</label>` : ''}
+        <button class="small ed-save" title="Save">💾</button><button class="small ed-cancel" title="Cancel">✕</button>`;
+      cfCell.querySelector('.ed-content').focus();
+      cfCell.querySelector('.ed-cancel').onclick = () => renderDetail(card, d);
+      cfCell.querySelector('.ed-save').onclick = async () => {
+        const body = {
+          recordId: rec.id,
+          type: rec.type,
+          content: cfCell.querySelector('.ed-content').value.trim(),
+        };
+        const prio = cfCell.querySelector('.ed-prio');
+        if (prio) body.priority = Number(prio.value);
+        const prox = cfCell.querySelector('.ed-prox');
+        if (prox) body.proxied = prox.checked;
+        if (rec.type === 'SRV') body.priority = rec.priority ?? 0;
+        try {
+          await api(`/api/domain/record-update?domain=${domain}`, { body });
+          toast(`${rec.type} ${rec.name} updated.`, 'ok');
+          reload();
+        } catch (err) { toast(err.message, 'err'); }
+      };
+    };
   });
 
   $$('.act-row', el).forEach((btn) => {
