@@ -18,7 +18,15 @@
   header h1 { font-size: 16px; margin: 0; }
   header h1 span { color: var(--dim); font-weight: 400; }
   .spacer { flex: 1; }
-  button { background: #21262d; color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 6px 14px; cursor: pointer; font-size: 14px; white-space: nowrap; }
+  /* Icon glyphs in buttons render ~20px while text stays normal: an emoji-range
+     font-face with size-adjust, applied only to buttons. */
+  @font-face {
+    font-family: 'BigIcon';
+    src: local('Apple Color Emoji');
+    size-adjust: 140%;
+    unicode-range: U+2190-21FF, U+2300-23FF, U+25A0-25FF, U+2600-27BF, U+2B00-2BFF, U+1F000-1FAFF;
+  }
+  button { background: #21262d; color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 6px 14px; cursor: pointer; font-size: 15px; white-space: nowrap; font-family: 'BigIcon', -apple-system, 'Segoe UI', sans-serif; }
   button:hover { border-color: var(--dim); }
   button:disabled { opacity: .45; cursor: default; }
   button.primary { background: #238636; border-color: #2ea043; }
