@@ -771,6 +771,22 @@ const routes = {
     return { steps, state: await domainState(domain) };
   },
 
+  'POST /api/domain/record-create': async (req, res, domain) => {
+    const { type, name, content, priority, proxied } = await readBody(req);
+    if (!type || !content?.trim()) throw new Error('type and content are required');
+    const zone = assertZone(await cloudflare.getZone(domain), domain);
+    if (!zone) throw new Error('No Cloudflare zone — create it first.');
+    let fqdn = (name || '@').trim().toLowerCase().replace(/\.$/, '');
+    fqdn = (fqdn === '' || fqdn === '@') ? domain
+      : (fqdn === domain || fqdn.endsWith(`.${domain}`)) ? fqdn : `${fqdn}.${domain}`;
+    assertBelongs(fqdn, domain);
+    const rec = { type: String(type).toUpperCase(), name: fqdn, content: content.trim() };
+    if (rec.type === 'MX' || rec.type === 'SRV') rec.priority = Number(priority) || 0;
+    const payload = toCloudflarePayload(rec, { proxyWeb: !!proxied });
+    const created = await cloudflare.createRecord(zone.id, payload);
+    return { ok: true, record: { type: created.type, name: created.name, content: created.content } };
+  },
+
   'POST /api/domain/record-update': async (req, res, domain) => {
     const { recordId, type, content, priority, proxied } = await readBody(req);
     if (!recordId) throw new Error('recordId required');

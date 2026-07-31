@@ -891,6 +891,7 @@ function renderDetail(card, d) {
         <span class="badge pointed" title="Saved ${esc(d.rollback.at)} — previous NS: ${esc(d.rollback.previousNs.join(', ') || '(none)')}${d.rollback.rolledBackAt ? ' · ROLLED BACK ' + esc(d.rollback.rolledBackAt) : ''}">↩ rollback saved</span>
         <button class="small danger act-rollback" ${d.rollback.previousNs?.length ? '' : 'disabled'}>↩ Roll back NS</button>
         <span class="sep"></span>` : ''}
+      <button class="small act-addrec" ${d.zone ? '' : 'disabled'} title="Create a new Cloudflare record in this zone">+ record</button>
       <button class="small act-probe-hosts" ${d.zone ? '' : 'disabled'} title="Probe every hostname in this zone">🔦 probe hosts</button>
       <button class="small act-diag" ${d.zone ? '' : 'disabled'} title="Deep site diagnostic (redirects, headers, indexability, content sanity)">🩺 diagnose</button>
       <button class="small act-report" title="Download a Markdown report for this domain">📄</button>
@@ -900,6 +901,8 @@ function renderDetail(card, d) {
     </div>
     <div class="hostprobe"></div>
     <div class="diagslot">${diagHtml(d.domain)}</div>
+    <div class="addrec"></div>
+    ${d.rows.length ? '' : `<div style="color:var(--dim);font-size:12px;margin-bottom:8px">No records on either side${d.zone ? ' — use “+ record” to create some' : ''}.</div>`}
     <table>
       <thead><tr><th></th><th>Enom</th><th></th><th>Cloudflare</th><th></th></tr></thead>
       <tbody>
@@ -999,6 +1002,57 @@ function renderDetail(card, d) {
       };
     };
   });
+
+  const addBtn = $('.act-addrec', el);
+  if (addBtn && !addBtn.disabled) {
+    addBtn.onclick = () => {
+      const box = $('.addrec', el);
+      if (box.innerHTML) { box.innerHTML = ''; return; }
+      const inputStyle = 'background:var(--panel);border:1px solid var(--border);border-radius:4px;color:var(--text);padding:3px 6px;font-family:var(--mono);font-size:12px';
+      box.innerHTML = `
+        <div style="display:flex;gap:6px;align-items:center;margin-bottom:8px;flex-wrap:wrap;background:var(--bg);border:1px solid var(--blue);border-radius:6px;padding:8px 10px">
+          <select class="ar-type" style="${inputStyle}">
+            ${['A', 'AAAA', 'CNAME', 'MX', 'TXT', 'SRV', 'NS'].map((t) => `<option>${t}</option>`).join('')}
+          </select>
+          <input class="ar-name" placeholder="@ or subdomain" style="${inputStyle};width:150px">
+          <span style="color:var(--dim)">→</span>
+          <input class="ar-content" style="${inputStyle};width:280px">
+          <input class="ar-prio" type="number" value="10" title="priority" style="${inputStyle};width:56px">
+          <label class="ar-proxwrap" style="font-size:11px;color:var(--dim);white-space:nowrap"><input type="checkbox" class="ar-prox"> ☁ proxy</label>
+          <button class="small primary ar-create">Create</button>
+          <button class="small ar-cancel">✕</button>
+        </div>`;
+      const typeSel = box.querySelector('.ar-type');
+      const syncFields = () => {
+        const t = typeSel.value;
+        box.querySelector('.ar-prio').style.display = (t === 'MX' || t === 'SRV') ? '' : 'none';
+        box.querySelector('.ar-proxwrap').style.display = ['A', 'AAAA', 'CNAME'].includes(t) ? '' : 'none';
+        box.querySelector('.ar-content').placeholder = {
+          A: '203.0.113.10', AAAA: '2001:db8::1', CNAME: 'target.example.com', MX: 'mail.example.com',
+          TXT: 'v=spf1 include:… ~all', SRV: 'weight port target (name: _sip._tls)', NS: 'ns1.example.com',
+        }[t] || 'content';
+      };
+      typeSel.onchange = syncFields;
+      syncFields();
+      box.querySelector('.ar-name').focus();
+      box.querySelector('.ar-cancel').onclick = () => { box.innerHTML = ''; };
+      box.querySelector('.ar-create').onclick = async () => {
+        const body = {
+          type: typeSel.value,
+          name: box.querySelector('.ar-name').value,
+          content: box.querySelector('.ar-content').value,
+          priority: Number(box.querySelector('.ar-prio').value) || 0,
+          proxied: box.querySelector('.ar-prox').checked,
+        };
+        if (!body.content.trim()) { toast('Content is required.', 'err'); return; }
+        try {
+          const r = await api(`/api/domain/record-create?domain=${domain}`, { body });
+          toast(`${r.record.type} ${r.record.name} created.`, 'ok');
+          reload();
+        } catch (err) { toast(err.message, 'err'); }
+      };
+    };
+  }
 
   $$('.act-toredirect', el).forEach((btn) => {
     btn.onclick = async () => {
