@@ -636,7 +636,7 @@ const routes = {
   'GET /api/domain': async (req, res, domain) => domainState(domain),
 
   'POST /api/email-report': async (req) => {
-    const { subject, markdown, to } = await readBody(req);
+    const { subject, markdown, html, to } = await readBody(req);
     if (!subject || !markdown) throw new Error('subject and markdown are required');
     if (!process.env.POSTMARK_TOKEN) throw new Error('POSTMARK_TOKEN not set — add it in ⚙ API Keys');
     const from = process.env.REPORT_FROM;
@@ -656,7 +656,7 @@ const routes = {
         To: recipient,
         Subject: subject,
         TextBody: markdown,
-        HtmlBody: `<pre style="font-family:ui-monospace,Menlo,monospace;font-size:13px;white-space:pre-wrap">${escHtml(markdown)}</pre>`,
+        HtmlBody: html || `<pre style="font-family:ui-monospace,Menlo,monospace;font-size:13px;white-space:pre-wrap">${escHtml(markdown)}</pre>`,
         MessageStream: 'outbound',
       }),
       signal: AbortSignal.timeout(15_000),

@@ -1348,14 +1348,15 @@ function renderDetail(card, d) {
   }
 
   $('.act-report', el).onclick = () => {
-    const date = new Date().toISOString().slice(0, 10);
-    downloadText(`report-${domain}-${date}.md`, `# ${domain} — DNS report ${date}\n\n${mdForDomain(domain)}\n`);
+    const { html, date } = composeReportHtml([domain]);
+    downloadText(`report-${domain}-${date}.html`, `<!doctype html><meta charset="utf-8"><title>${domain} — DNS report</title>${html}`);
     toast(`Report downloaded for ${domain}.`, 'ok');
   };
 
   $('.act-email-report', el).onclick = () => {
     const date = new Date().toISOString().slice(0, 10);
-    emailMd(`DNS report — ${domain} — ${date}`, `# ${domain} — DNS report ${date}\n\n${mdForDomain(domain)}\n`);
+    const { html } = composeReportHtml([domain]);
+    emailMd(`DNS report — ${domain} — ${date}`, `# ${domain} — DNS report ${date}\n\n${mdForDomain(domain)}\n`, { html });
   };
 
   $('.act-reload', el).onclick = reload;
@@ -1701,6 +1702,118 @@ function composeBulkMd(targets) {
   return { md: `${head.join('\n')}\n${body}\n`, date };
 }
 
+/* ---------- HTML report (email-safe: inline styles, light surface, tables) ---------- */
+
+// Status styling per dataviz rules: tinted pill + dark same-family ink + icon + word — never color alone.
+const RPT = {
+  ink: '#1a1f2b', dim: '#5c667a', line: '#e4e8ef', card: '#ffffff', bg: '#f4f6f9',
+  good: { bg: '#e7f6e7', ink: '#0a6b0a', icon: '✓' },
+  warn: { bg: '#fdf3d9', ink: '#8a6103', icon: '⚠' },
+  bad: { bg: '#fde8e2', ink: '#b3421f', icon: '✗' },
+  info: { bg: '#eef1f6', ink: '#5c667a', icon: '·' },
+};
+const rPill = (kind, label) => {
+  const k = RPT[kind] || RPT.info;
+  return `<span style="display:inline-block;background:${k.bg};color:${k.ink};border-radius:999px;padding:2px 10px;font-size:12px;font-weight:600;white-space:nowrap">${k.icon} ${esc(label)}</span>`;
+};
+const rTile = (num, label, kind) => `
+  <td style="background:${RPT.card};border:1px solid ${RPT.line};border-radius:10px;padding:14px 8px 11px;text-align:center">
+    <div style="font-size:26px;font-weight:700;color:${kind ? RPT[kind].ink : RPT.ink};font-family:ui-monospace,Menlo,monospace;line-height:1.1">${num}</div>
+    <div style="font-size:10.5px;color:${RPT.dim};text-transform:uppercase;letter-spacing:.8px;margin-top:3px">${esc(label)}</div>
+  </td>`;
+
+/** Everything known about one domain, distilled into a status + issue list. */
+function domainInsight(domain) {
+  const det = state.detail[domain];
+  const s = state.scan[domain] || (det ? summaryFromDetail(det) : null);
+  const h = state.health[domain];
+  const dg = state.diag[domain];
+  const issues = [];
+  let zone = s ? (s.zoneStatus || 'none') : '?';
+  let matched = s ? s.same : null;
+  if (s) {
+    if (!s.zoneStatus) issues.push('No Cloudflare zone yet');
+    if (s.missing) issues.push(`${s.missing} record(s) missing in Cloudflare`);
+    if (s.mailGaps) issues.push(`${s.mailProvider}: ${s.mailGaps} mail gap(s)`);
+    if (s.redirectsPending) issues.push(`${s.redirectsPending} redirect(s) not migrated`);
+    if (s.errors) issues.push('scan error — source unreadable');
+  }
+  if (det?.mail?.contamination?.length) det.mail.contamination.forEach((c) => issues.push(`Cross-domain DKIM: ${c.msg}`));
+  if (h && UP_BAD(h.class)) issues.push(`Down: ${h.class}${h.status ? ` ${h.status}` : ''}${h.detail ? ` — ${h.detail}` : ''}`);
+  if (dg?.fails) dg.checks.filter((c) => c.status === 'fail').forEach((c) => issues.push(`${c.label}${c.detail ? ` — ${c.detail}` : ''}`));
+  const hp = state.hostprobe[domain];
+  if (hp) hp.filter((r) => r.class !== 'live').forEach((r) => issues.push(`Host ${r.host}: ${r.class}${r.detail ? ` — ${r.detail}` : ''}`));
+  const pointed = s ? s.pointedAtCf : false;
+  return { domain, zone, pointed, matched, missing: s?.missing ?? null, issues, uptime: h || null, scanned: !!s };
+}
+
+function composeReportHtml(targets) {
+  const now = new Date();
+  const date = now.toISOString().slice(0, 10);
+  const insights = targets.map(domainInsight);
+  const scanned = insights.filter((i) => i.scanned);
+  const problems = insights.filter((i) => i.issues.length);
+  const clean = insights.filter((i) => !i.issues.length && i.scanned);
+  const healths = targets.map((d) => state.health[d]).filter(Boolean);
+  const up = healths.filter((h) => h.class === 'live').length;
+  const down = healths.filter((h) => UP_BAD(h.class)).length;
+  const active = insights.filter((i) => i.zone === 'active').length;
+  const pending = insights.filter((i) => i.zone && i.zone !== 'active' && i.zone !== 'none' && i.zone !== '?').length;
+  const cut = insights.filter((i) => i.pointed).length;
+  const synced = scanned.filter((i) => i.missing === 0 && i.zone !== 'none').length;
+
+  const zonePill = (i) => i.zone === 'active' ? rPill('good', 'active') : i.zone === 'none' ? rPill('bad', 'no zone') : i.zone === '?' ? rPill('info', 'not scanned') : rPill('warn', i.zone);
+  const upPill = (i) => !i.uptime ? rPill('info', 'not probed') : i.uptime.class === 'live' ? rPill('good', `live${i.uptime.ms ? ` ${i.uptime.ms}ms` : ''}`) : i.uptime.class === 'pending-zone' ? rPill('info', 'pending') : rPill('bad', `${i.uptime.class}${i.uptime.status ? ` ${i.uptime.status}` : ''}`);
+  const recPill = (i) => i.missing === null ? rPill('info', '—') : i.missing === 0 ? rPill('good', `all ${i.matched} match`) : rPill('bad', `${i.missing} missing`);
+
+  const problemCards = problems.map((i) => `
+    <div style="background:${RPT.card};border:1px solid ${RPT.line};border-left:4px solid ${RPT.bad.ink};border-radius:10px;padding:12px 16px;margin-bottom:10px">
+      <div style="font-family:ui-monospace,Menlo,monospace;font-weight:700;font-size:14px;color:${RPT.ink};margin-bottom:6px">${esc(i.domain)} &nbsp;${zonePill(i)} ${upPill(i)}</div>
+      ${i.issues.map((x) => `<div style="font-size:13px;color:${RPT.ink};padding:2px 0">${RPT.bad.icon} ${esc(x)}</div>`).join('')}
+    </div>`).join('');
+
+  const fleetRows = insights.map((i) => `
+    <tr>
+      <td style="padding:7px 10px;border-bottom:1px solid ${RPT.line};font-family:ui-monospace,Menlo,monospace;font-size:12.5px;color:${RPT.ink}">${esc(i.domain)}</td>
+      <td style="padding:7px 10px;border-bottom:1px solid ${RPT.line}">${zonePill(i)}</td>
+      <td style="padding:7px 10px;border-bottom:1px solid ${RPT.line}">${recPill(i)}</td>
+      <td style="padding:7px 10px;border-bottom:1px solid ${RPT.line}">${i.pointed ? rPill('good', 'NS → Cloudflare') : rPill('info', 'not cut over')}</td>
+      <td style="padding:7px 10px;border-bottom:1px solid ${RPT.line}">${upPill(i)}</td>
+    </tr>`).join('');
+
+  const html = `
+<div style="background:${RPT.bg};padding:28px 14px;font-family:-apple-system,'Segoe UI',sans-serif;color:${RPT.ink}">
+  <div style="max-width:720px;margin:0 auto">
+    <div style="margin-bottom:16px">
+      <div style="font-size:19px;font-weight:750">DNS Migration Report</div>
+      <div style="font-size:12.5px;color:${RPT.dim}">${esc(date)} · ${targets.length} domain(s) · generated by dns-cutover</div>
+    </div>
+    <table role="presentation" cellspacing="6" cellpadding="0" style="width:100%;border-collapse:separate;margin-bottom:6px"><tr>
+      ${rTile(targets.length, 'domains')}
+      ${rTile(active, 'zones active', active ? 'good' : null)}
+      ${rTile(pending, 'pending', pending ? 'warn' : null)}
+      ${rTile(scanned.length ? synced : '—', 'fully synced', synced ? 'good' : null)}
+      ${rTile(cut, 'cut over')}
+      ${rTile(healths.length ? `${up}/${down}` : '—', 'up / down', down ? 'bad' : (up ? 'good' : null))}
+    </tr></table>
+    ${problems.length ? `
+      <div style="font-size:14px;font-weight:700;margin:18px 0 8px">${RPT.bad.icon} Needs attention — ${problems.length} domain(s)</div>
+      ${problemCards}` : `
+      <div style="background:${RPT.good.bg};color:${RPT.good.ink};border-radius:10px;padding:12px 16px;margin:16px 0;font-size:13.5px;font-weight:600">${RPT.good.icon} No issues detected across ${scanned.length} scanned domain(s).</div>`}
+    ${clean.length && problems.length ? `<div style="font-size:12.5px;color:${RPT.dim};margin:4px 0 14px">${RPT.good.icon} ${clean.length} other domain(s) fully clean.</div>` : ''}
+    <div style="font-size:14px;font-weight:700;margin:18px 0 8px">Fleet status</div>
+    <div style="background:${RPT.card};border:1px solid ${RPT.line};border-radius:10px;overflow:hidden">
+      <table role="presentation" cellspacing="0" cellpadding="0" style="width:100%;border-collapse:collapse">
+        <tr>${['Domain', 'Zone', 'Records', 'Nameservers', 'Uptime'].map((h) => `<th style="text-align:left;padding:8px 10px;font-size:10.5px;letter-spacing:.8px;text-transform:uppercase;color:${RPT.dim};border-bottom:1px solid ${RPT.line}">${h}</th>`).join('')}</tr>
+        ${fleetRows}
+      </table>
+    </div>
+    <div style="font-size:11.5px;color:${RPT.dim};margin-top:16px">Sections marked "not scanned / not probed" were not checked this session. Generated ${esc(now.toISOString())}.</div>
+  </div>
+</div>`;
+  return { html, date };
+}
+
 function reportTargets() {
   const sel = $$('.sel-domain:checked').map((cb) => cb.dataset.domain);
   return sel.length ? sel : visibleDomains().map((d) => d.domain);
@@ -1709,20 +1822,20 @@ function reportTargets() {
 function bulkReport() {
   const targets = reportTargets();
   if (!targets.length) { toast('Nothing to report on.', 'err'); return; }
-  const { md, date } = composeBulkMd(targets);
-  downloadText(`dns-report-${date}.md`, md);
+  const { html, date } = composeReportHtml(targets);
+  downloadText(`dns-report-${date}.html`, `<!doctype html><meta charset="utf-8"><title>DNS report ${date}</title>${html}`);
   toast(`Report generated for ${targets.length} domain(s).`, 'ok');
 }
 $('#btn-report').onclick = bulkReport;
 
-async function emailMd(subject, md, { promptTo = true } = {}) {
+async function emailMd(subject, md, { promptTo = true, html } = {}) {
   let to = state.reportTo || '';
   if (promptTo) {
     to = prompt('Email report to:', to) || '';
     if (!to.trim()) return;
   }
   try {
-    const r = await api('/api/email-report', { body: { subject, markdown: md, to: to.trim() || undefined } });
+    const r = await api('/api/email-report', { body: { subject, markdown: md, html, to: to.trim() || undefined } });
     toast(`Report emailed to ${r.to}.`, 'ok');
   } catch (err) { toast(err.message, 'err'); }
 }
@@ -1731,7 +1844,8 @@ $('#btn-email-report').onclick = () => {
   const targets = reportTargets();
   if (!targets.length) { toast('Nothing to report on.', 'err'); return; }
   const { md, date } = composeBulkMd(targets);
-  emailMd(`DNS migration report — ${targets.length} domain(s) — ${date}`, md);
+  const { html } = composeReportHtml(targets);
+  emailMd(`DNS migration report — ${targets.length} domain(s) — ${date}`, md, { html });
 };
 
 /** Triage: problems only, grouped by failure class, with recommended actions. */
@@ -1799,11 +1913,18 @@ $('#btn-triage').onclick = async () => {
 function autoEmailRun(kind, targets) {
   if (!state.pbEmail) return;
   const { md, date } = composeBulkMd(targets);
+  const { html } = composeReportHtml(targets);
   const log = state.pbLogText.join('\n');
+  const logHtml = `${html}
+    <div style="max-width:720px;margin:0 auto;padding:0 14px 28px;font-family:-apple-system,'Segoe UI',sans-serif">
+      <div style="font-size:14px;font-weight:700;margin:6px 0 8px;color:#1a1f2b">Run log</div>
+      <pre style="background:#ffffff;border:1px solid #e4e8ef;border-radius:10px;padding:12px 14px;font-family:ui-monospace,Menlo,monospace;font-size:11.5px;white-space:pre-wrap;color:#1a1f2b">${log.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]))}</pre>
+    </div>`;
   api('/api/email-report', {
     body: {
       subject: `dns-cutover ${kind} report — ${targets.length} domain(s) — ${date}`,
       markdown: `${md}\n\n## Run log\n\n\`\`\`\n${log}\n\`\`\`\n`,
+      html: logHtml,
     },
   }).then((r) => toast(`${kind} report emailed to ${r.to}.`, 'ok'))
     .catch((err) => toast(`Auto-email failed: ${err.message}`, 'err'));
