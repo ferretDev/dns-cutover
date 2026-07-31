@@ -9,6 +9,7 @@ import { readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as enom from './lib/enom.js';
+import { activeProvider } from './lib/providers/index.js';
 import * as cloudflare from './lib/cloudflare.js';
 import { loadConfig, saveConfig, maskedConfig } from './lib/config.js';
 import {
@@ -70,22 +71,22 @@ function assertZone(zone, domain) {
 
 /** Full state for one domain: both zones, NS, aligned rows. */
 async function domainState(domain) {
-  const [hostsR, srvR, nsR, zoneR] = await Promise.allSettled([
-    enom.getHosts(domain),
-    enom.getSrvHosts(domain),
-    enom.getNameservers(domain),
+  const prov = activeProvider();
+  const [srcR, nsR, zoneR] = await Promise.allSettled([
+    prov.getZone(domain),
+    prov.getNameservers(domain),
     cloudflare.getZone(domain),
   ]);
   const errors = [];
-  const hosts = hostsR.status === 'fulfilled' ? hostsR.value : (errors.push(`Enom records: ${hostsR.reason.message}`), []);
-  const srvHosts = srvR.status === 'fulfilled' ? srvR.value : (errors.push(`Enom SRV records: ${srvR.reason.message}`), []);
-  const enomNs = nsR.status === 'fulfilled' ? nsR.value : (errors.push(`Enom NS: ${nsR.reason.message}`), { nameservers: [] });
+  const src = srcR.status === 'fulfilled' ? srcR.value
+    : (errors.push(`${prov.name} records: ${srcR.reason.message}`), { records: [], redirects: [], warnings: [], errors: [] });
+  const enomNs = nsR.status === 'fulfilled' ? nsR.value : (errors.push(`${prov.name} NS: ${nsR.reason.message}`), { nameservers: [] });
   const zone = zoneR.status === 'fulfilled' ? assertZone(zoneR.value, domain) : (errors.push(`Cloudflare: ${zoneR.reason.message}`), null);
 
-  const { records: enomRecords, warnings, redirects: enomRedirects } = fromEnom(hosts, domain);
-  const srv = fromEnomSrv(srvHosts, domain);
-  enomRecords.push(...srv.records);
-  warnings.push(...srv.warnings);
+  const enomRecords = src.records;
+  const warnings = [...src.warnings];
+  const enomRedirects = src.redirects;
+  errors.push(...(src.errors || []).map((e) => `${prov.name}: ${e}`));
   let cfRecords = [];
   let cfRedirects = [];
   if (zone) {
@@ -119,6 +120,7 @@ async function domainState(domain) {
 
   return {
     domain,
+    provider: prov.name,
     rows: buildRows(enomRecords, cfRecords),
     mail: analyzeMail(enomRecords, cfRecords, domain),
     rollback: getRollbacks()[domain] || null,
@@ -158,6 +160,8 @@ async function syncRecords(domain, direction, keys) {
       }
     }
   } else if (direction === 'to-enom') {
+    const prov = activeProvider();
+    if (!prov.caps.syncBack) throw new Error(`${prov.name} does not support writing records back to the source — one-way migration only`);
     const targets = state.rows.filter((r) => r.status === 'cf-only' && (all || wanted.has(r.key)));
     const writable = targets.filter((r) => ENOM_WRITABLE.has(r.cf.type));
     for (const r of targets.filter((t) => !ENOM_WRITABLE.has(t.cf.type))) {
@@ -166,10 +170,10 @@ async function syncRecords(domain, direction, keys) {
     if (writable.length) {
       // SetHosts replaces the whole zone — resubmit current hosts + additions in one call.
       writable.forEach((r) => assertBelongs(r.cf.name, domain));
-      const current = await enom.getHosts(domain);
+      const current = await prov.getRawHosts(domain);
       const additions = writable.map((r) => toEnomHost(r.cf, domain));
       try {
-        await enom.setHosts(domain, [...current, ...additions]);
+        await prov.setHosts(domain, [...current, ...additions]);
         for (const r of writable) results.push({ key: r.key, ok: true });
       } catch (err) {
         for (const r of writable) results.push({ key: r.key, ok: false, message: err.message });
@@ -265,9 +269,11 @@ async function rdapLookup(domain) {
 }
 
 async function transferRow(domain) {
+  const prov = activeProvider();
+  const unsupported = async () => { throw new Error(`not supported by ${prov.name} — manage at the registrar`); };
   const [lockR, wppsR, rdapR] = await Promise.allSettled([
-    enom.getRegLock(domain),
-    enom.getWppsInfo(domain),
+    prov.caps.transferBoard ? prov.getRegLock(domain) : unsupported(),
+    prov.caps.transferBoard ? prov.getWppsInfo(domain) : unsupported(),
     rdapLookup(domain),
   ]);
   const rdap = rdapR.status === 'fulfilled' ? rdapR.value : { registrar: null, statuses: [] };
@@ -578,7 +584,7 @@ async function runPlaybook(domain, config = {}) {
     else if (!verified) add('cutover', 'blocked', 'verification failed');
     else if (!s.cfNs.length) add('cutover', 'blocked', 'Cloudflare has not assigned nameservers yet');
     else {
-      await enom.setNameservers(domain, s.cfNs);
+      await activeProvider().setNameservers(domain, s.cfNs);
       saveRollback(domain, { previousNs: s.enomNs, newNs: s.cfNs, at: new Date().toISOString() });
       add('cutover', 'ok', `NS → ${s.cfNs.join(', ')} (rollback saved)`);
       s = await domainState(domain);
@@ -602,11 +608,12 @@ const routes = {
 
   'POST /api/test': async () => {
     const out = {};
+    const prov = activeProvider();
     try {
-      const domains = await enom.listDomains();
-      out.enom = { ok: true, message: `${domains.length} domain(s) visible` };
+      const t = await prov.test();
+      out.enom = { ok: t.ok, message: `${prov.name}: ${t.message}` };
     } catch (err) {
-      out.enom = { ok: false, message: err.message };
+      out.enom = { ok: false, message: `${prov.name}: ${err.message}` };
     }
     try {
       const zones = await cloudflare.listZones();
@@ -618,7 +625,7 @@ const routes = {
   },
 
   'GET /api/domains': async () => {
-    const [domains, zones] = await Promise.all([enom.listDomains(), cloudflare.listZones()]);
+    const [domains, zones] = await Promise.all([activeProvider().listDomains(), cloudflare.listZones()]);
     const zoneByName = new Map(zones.map((z) => [z.name.toLowerCase(), z]));
     return domains.map((d) => {
       const z = zoneByName.get(d);
@@ -731,7 +738,7 @@ const routes = {
     const { force } = await readBody(req);
     if (missing && !force) throw new Error(`${missing} record(s) missing in Cloudflare — sync first or force.`);
     const previous = state.enomNs;
-    await enom.setNameservers(domain, state.cfNs);
+    await activeProvider().setNameservers(domain, state.cfNs);
     saveRollback(domain, { previousNs: previous, newNs: state.cfNs, at: new Date().toISOString() });
     return { ok: true, previousNs: previous, newNs: state.cfNs, state: await domainState(domain) };
   },
@@ -740,7 +747,7 @@ const routes = {
     const entry = getRollbacks()[domain];
     if (!entry) throw new Error('No rollback snapshot stored for this domain.');
     if (!entry.previousNs?.length) throw new Error('Rollback snapshot has no nameservers — restore manually.');
-    await enom.setNameservers(domain, entry.previousNs);
+    await activeProvider().setNameservers(domain, entry.previousNs);
     markRolledBack(domain);
     return { ok: true, restoredNs: entry.previousNs, state: await domainState(domain) };
   },
@@ -828,6 +835,8 @@ const routes = {
   },
 
   'POST /api/domain/epp': async (req, res, domain) => {
+    const prov = activeProvider();
+    if (!prov.caps.epp) throw new Error(`EPP automation is not supported for ${prov.name} — get the auth code from the registrar panel`);
     const { unlock } = await readBody(req);
     const steps = [];
     if (unlock) {
@@ -857,6 +866,8 @@ const routes = {
 
   'POST /api/transfer/action': async (req, res, domain) => {
     if (!domain) throw new Error('Missing ?domain=');
+    const prov = activeProvider();
+    if (!prov.caps.transferBoard) throw new Error(`Transfer actions are not supported for ${prov.name} — manage at the registrar`);
     const { action } = await readBody(req);
     if (action === 'unlock') {
       await enom.setRegLock(domain, false);
@@ -877,6 +888,8 @@ const routes = {
   },
 
   'POST /api/transfer/prep': async (req) => {
+    const prov = activeProvider();
+    if (!prov.caps.transferBoard) throw new Error(`Transfer prep is not supported for ${prov.name} — manage at the registrar`);
     const { domains = [] } = await readBody(req);
     const results = [];
     for (const domain of domains) {
@@ -1113,16 +1126,17 @@ const routes = {
   },
 
   'POST /api/tools/verify-source-ips': async () => {
-    const [domains, zones] = await Promise.all([enom.listDomains(), cloudflare.listZones()]);
+    const prov = activeProvider();
+    const [domains, zones] = await Promise.all([prov.listDomains(), cloudflare.listZones()]);
     const zoneByName = new Map(zones.map((z) => [z.name.toLowerCase(), z]));
     const targets = domains.filter((d) => zoneByName.has(d));
     const mismatches = [];
     await pooled(targets, 4, async (d) => {
-      const [hosts, cfRaw] = await Promise.all([
-        enom.getHosts(d),
+      const [srcZone, cfRaw] = await Promise.all([
+        prov.getZone(d),
         cloudflare.listRecords(zoneByName.get(d).id),
       ]);
-      const { records: enomRecs } = fromEnom(hosts, d);
+      const enomRecs = srcZone.records;
       const ipsByName = (recs) => {
         const m = new Map();
         for (const r of recs) {

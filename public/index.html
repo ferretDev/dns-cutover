@@ -223,12 +223,28 @@
 
 <main>
   <section id="settings">
+    <div style="margin-bottom:12px">
+      <label style="display:block;font-size:11.5px;color:var(--dim);margin-bottom:4px;letter-spacing:.3px">Source provider — where domains live before Cloudflare</label>
+      <select id="cfg-PROVIDER" style="background:var(--inset);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:7px 10px;font-size:13px">
+        <option value="enom">Enom (reseller API — full support: sync-back, transfers, EPP)</option>
+        <option value="godaddy">GoDaddy (records + NS cutover; transfers managed at registrar)</option>
+        <option value="namecheap">Namecheap (records + redirects + NS cutover; IP-whitelisted API)</option>
+        <option value="porkbun">Porkbun (records + NS cutover)</option>
+      </select>
+    </div>
     <div class="grid">
-      <div><label>Enom UID</label><input id="cfg-ENOM_UID" autocomplete="off"></div>
-      <div><label>Enom password / API token</label><input id="cfg-ENOM_PW" type="password" autocomplete="off"></div>
-      <div><label>Enom environment</label>
+      <div class="prov prov-enom"><label>Enom UID</label><input id="cfg-ENOM_UID" autocomplete="off"></div>
+      <div class="prov prov-enom"><label>Enom password / API token</label><input id="cfg-ENOM_PW" type="password" autocomplete="off"></div>
+      <div class="prov prov-enom"><label>Enom environment</label>
         <select id="cfg-ENOM_ENV"><option value="prod">prod (reseller.enom.com)</option><option value="test">test (resellertest.enom.com)</option></select>
       </div>
+      <div class="prov prov-godaddy"><label>GoDaddy API key</label><input id="cfg-GODADDY_KEY" autocomplete="off"></div>
+      <div class="prov prov-godaddy"><label>GoDaddy API secret</label><input id="cfg-GODADDY_SECRET" type="password" autocomplete="off"></div>
+      <div class="prov prov-namecheap"><label>Namecheap username</label><input id="cfg-NAMECHEAP_USER" autocomplete="off"></div>
+      <div class="prov prov-namecheap"><label>Namecheap API key</label><input id="cfg-NAMECHEAP_KEY" type="password" autocomplete="off"></div>
+      <div class="prov prov-namecheap"><label>Namecheap whitelisted client IP</label><input id="cfg-NAMECHEAP_CLIENT_IP" autocomplete="off" placeholder="your public IP"></div>
+      <div class="prov prov-porkbun"><label>Porkbun API key</label><input id="cfg-PORKBUN_KEY" autocomplete="off"></div>
+      <div class="prov prov-porkbun"><label>Porkbun secret API key</label><input id="cfg-PORKBUN_SECRET" type="password" autocomplete="off"></div>
       <div><label>Cloudflare API token</label><input id="cfg-CF_API_TOKEN" type="password" autocomplete="off"></div>
       <div><label>Cloudflare account ID</label><input id="cfg-CF_ACCOUNT_ID" autocomplete="off"></div>
       <div><label>Postmark server token (for emailed reports)</label><input id="cfg-POSTMARK_TOKEN" type="password" autocomplete="off"></div>
@@ -742,18 +758,28 @@ async function api(path, opts = {}) {
 
 /* ---------- settings ---------- */
 
-const CFG_KEYS = ['ENOM_UID', 'ENOM_PW', 'ENOM_ENV', 'CF_API_TOKEN', 'CF_ACCOUNT_ID', 'POSTMARK_TOKEN', 'REPORT_FROM', 'REPORT_TO'];
+const CFG_KEYS = ['PROVIDER', 'ENOM_UID', 'ENOM_PW', 'ENOM_ENV', 'GODADDY_KEY', 'GODADDY_SECRET', 'NAMECHEAP_USER', 'NAMECHEAP_KEY', 'NAMECHEAP_CLIENT_IP', 'PORKBUN_KEY', 'PORKBUN_SECRET', 'CF_API_TOKEN', 'CF_ACCOUNT_ID', 'POSTMARK_TOKEN', 'REPORT_FROM', 'REPORT_TO'];
+const SELECT_KEYS = new Set(['PROVIDER', 'ENOM_ENV']);
+
+function syncProviderFields() {
+  const prov = $('#cfg-PROVIDER').value || 'enom';
+  $$('#settings .prov').forEach((el) => {
+    el.style.display = el.classList.contains(`prov-${prov}`) ? '' : 'none';
+  });
+}
 
 async function loadSettings() {
   const cfg = await api('/api/config');
   for (const k of CFG_KEYS) {
     const input = $('#cfg-' + k);
-    if (k === 'ENOM_ENV') input.value = cfg[k] || 'prod';
+    if (SELECT_KEYS.has(k)) input.value = cfg[k] || (k === 'PROVIDER' ? 'enom' : 'prod');
     else input.placeholder = cfg[k] ? `current: ${cfg[k]}` : (input.placeholder || '(not set)');
   }
   state.reportTo = cfg.REPORT_TO || '';
   state.emailReady = !!(cfg.POSTMARK_TOKEN && cfg.REPORT_FROM);
+  syncProviderFields();
 }
+$('#cfg-PROVIDER').onchange = syncProviderFields;
 
 $('#btn-settings').onclick = () => $('#settings').classList.toggle('open');
 
@@ -761,13 +787,14 @@ $('#btn-save-cfg').onclick = async () => {
   const body = {};
   for (const k of CFG_KEYS) {
     const v = $('#cfg-' + k).value;
-    if (k === 'ENOM_ENV') body[k] = v;
+    if (SELECT_KEYS.has(k)) body[k] = v;
     else if (v !== '') body[k] = v;
   }
   await api('/api/config', { body });
-  for (const k of CFG_KEYS) if (k !== 'ENOM_ENV') $('#cfg-' + k).value = '';
+  for (const k of CFG_KEYS) if (!SELECT_KEYS.has(k)) $('#cfg-' + k).value = '';
   await loadSettings();
-  toast('Keys saved.', 'ok');
+  toast('Keys saved. Provider changes apply immediately — hit ↻ Refresh domains.', 'ok');
+  refreshDomains(true);
 };
 
 $('#btn-test-cfg').onclick = async () => {
@@ -954,7 +981,7 @@ function renderDetail(card, d) {
   el.innerHTML = `
     <div class="nsgrid">
       <div class="nsbox ${d.pointedAtCf ? 'good' : ''}">
-        <h4>Enom · registrar NS</h4>
+        <h4>${esc(d.provider || 'Source')} · registrar NS</h4>
         ${d.enomNs.map((n) => esc(n)).join('<br>') || '<span style="color:var(--dim)">(none)</span>'}
       </div>
       <div class="nsarrow">${d.pointedAtCf ? '✓' : '→'}</div>
@@ -991,7 +1018,7 @@ function renderDetail(card, d) {
     <div class="addrec"></div>
     ${d.rows.length ? '' : `<div style="color:var(--dim);font-size:12px;margin-bottom:8px">No records on either side${d.zone ? ' — use “+ record” to create some' : ''}.</div>`}
     <table>
-      <thead><tr><th></th><th>Enom</th><th></th><th>Cloudflare</th><th></th></tr></thead>
+      <thead><tr><th></th><th>${esc(d.provider || 'Source')}</th><th></th><th>Cloudflare</th><th></th></tr></thead>
       <tbody>
         ${d.rows.map((r) => {
           const enom = r.enom ? { ...r.enom, _side: 'enom' } : null;
@@ -1011,9 +1038,9 @@ function renderDetail(card, d) {
       </tbody>
     </table>
     ${(d.redirects?.length || d.cfRedirects?.length) ? `
-    <h4 style="margin:14px 0 6px;font-size:12px;color:var(--dim);text-transform:uppercase;letter-spacing:.5px">Redirects · Enom URL records → Cloudflare redirect rules</h4>
+    <h4 style="margin:14px 0 6px;font-size:12px;color:var(--dim);text-transform:uppercase;letter-spacing:.5px">Redirects · source URL records → Cloudflare redirect rules</h4>
     <table>
-      <thead><tr><th>Enom</th><th></th><th>Cloudflare</th><th></th></tr></thead>
+      <thead><tr><th>${esc(d.provider || 'Source')}</th><th></th><th>Cloudflare</th><th></th></tr></thead>
       <tbody>
         ${(d.redirects || []).map((r) => `
           <tr class="${r.covered ? 'same' : 'enom-only'}">
@@ -1974,7 +2001,11 @@ $('#btn-find-dmarc').onclick = async () => {
 (async () => {
   await loadSettings().catch(() => {});
   const cfg = await api('/api/config').catch(() => ({}));
-  const configured = cfg.ENOM_UID && cfg.CF_API_TOKEN;
+  const provNames = { enom: 'Enom', godaddy: 'GoDaddy', namecheap: 'Namecheap', porkbun: 'Porkbun' };
+  const provName = provNames[cfg.PROVIDER || 'enom'] || 'Source';
+  document.querySelector('header h1 span').textContent = `· ${provName} → Cloudflare migration desk`;
+  const provConfigured = { enom: cfg.ENOM_UID, godaddy: cfg.GODADDY_KEY, namecheap: cfg.NAMECHEAP_KEY, porkbun: cfg.PORKBUN_KEY }[cfg.PROVIDER || 'enom'];
+  const configured = provConfigured && cfg.CF_API_TOKEN;
   if (!configured) $('#settings').classList.add('open');
   try {
     ({ playbooks: state.playbooks } = await api('/api/playbooks'));
