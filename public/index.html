@@ -18,12 +18,13 @@
   header h1 { font-size: 16px; margin: 0; }
   header h1 span { color: var(--dim); font-weight: 400; }
   .spacer { flex: 1; }
-  button { background: #21262d; color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 5px 12px; cursor: pointer; font-size: 13px; white-space: nowrap; }
+  button { background: #21262d; color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 6px 14px; cursor: pointer; font-size: 14px; white-space: nowrap; }
   button:hover { border-color: var(--dim); }
   button:disabled { opacity: .45; cursor: default; }
   button.primary { background: #238636; border-color: #2ea043; }
   button.danger { background: #6e1a1a; border-color: var(--red); }
-  button.small { padding: 2px 8px; font-size: 12px; }
+  button.small { padding: 5px 11px; font-size: 13.5px; }
+  td.act { width: auto; white-space: nowrap; }
   main { max-width: 1400px; margin: 0 auto; padding: 16px 20px 80px; }
 
   /* settings */
@@ -238,7 +239,7 @@
     <button class="small" id="btn-diag" title="Deep site diagnostics for visible active zones">🩺 Diagnose</button>
     <span class="vsep"></span>
     <button class="small" id="btn-report" title="Markdown report for selected (or visible) domains from current scan/probe/diagnostic data">📄 Report</button>
-    <button class="small" id="btn-email-report" title="Email the same report via Postmark (configure in ⚙ API Keys)">✉</button>
+    <button class="small" id="btn-email-report" title="Email the same report via Postmark (configure in ⚙ API Keys)">✉ Email</button>
     <button class="small" id="btn-triage" title="Problems-only report: every flag grouped by failure class with recommended actions">🚑 Triage</button>
     <span class="vsep"></span>
     <label style="font-size:12px;color:var(--dim);white-space:nowrap" title="Probe a domain's hostnames automatically when its accordion opens"><input type="checkbox" id="autoprobe-toggle"> auto-probe</label>
