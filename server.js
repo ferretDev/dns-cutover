@@ -992,6 +992,27 @@ const routes = {
     return { results };
   },
 
+  'POST /api/tools/find-bad-redirects': async () => {
+    const zones = await cloudflare.listZones();
+    const bad = [];
+    await pooled(zones, 8, async (z) => {
+      let rules;
+      try { rules = await cloudflare.getRedirectRules(z.id); } catch { return; }
+      for (const r of rules) {
+        const tv = r.action_parameters?.from_value?.target_url;
+        const t = tv?.value;
+        if (!t && !tv?.expression) {
+          bad.push({ domain: z.name, expression: r.expression, target: '(empty)', problem: 'no target' });
+        } else if (t && !/^https?:\/\//i.test(t)) {
+          bad.push({ domain: z.name, expression: r.expression, target: t, problem: 'missing scheme — redirect broken' });
+        } else if (t && /^https?:\/\/[^/]*\.(?:\/|$)/i.test(t)) {
+          bad.push({ domain: z.name, expression: r.expression, target: t, problem: 'trailing dot in host — cert mismatch' });
+        }
+      }
+    });
+    return { bad };
+  },
+
   'POST /api/tools/find-proxied': async (req) => {
     const { pattern } = await readBody(req);
     if (!pattern || pattern.trim().length < 2) throw new Error('Pattern must be at least 2 characters.');

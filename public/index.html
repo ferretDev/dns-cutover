@@ -1630,7 +1630,7 @@ const TRIAGE_CLASSES = {
   'client-error': ['4xx response', 'Verify this is expected (auth wall, removed content).'],
 };
 
-function composeTriageMd() {
+function composeTriageMd(badRedirects = []) {
   const now = new Date();
   const date = now.toISOString().slice(0, 10);
   const L = [`# DNS triage report — ${date}`, ''];
@@ -1660,13 +1660,22 @@ function composeTriageMd() {
     if (fails.length) diagIssues.push(`- ${d} — ${fails.map((c) => c.label + (c.detail ? ` (${c.detail})` : '')).join('; ')}`);
   }
   if (diagIssues.length) L.push(`## Diagnostic failures (${diagIssues.length})`, '**Action:** site-level problems — noindex, parked pages, redirect loops. Fix at origin or in Cloudflare rules.', '', ...diagIssues.sort(), '');
-  if (!downs.length && !scanIssues.length && !diagIssues.length) L.push('All clear — nothing flagged by uptime, scans, or diagnostics.');
+  if (badRedirects.length) {
+    L.push(`## Malformed redirect rules (${badRedirects.length})`, '**Action:** targets need a scheme / clean hostname — edit the rule or re-run the redirect step (creation is normalized now).', '');
+    badRedirects.forEach((b) => L.push(`- ${b.domain} — ${b.expression} → ${b.target} (${b.problem})`));
+    L.push('');
+  }
+  if (!downs.length && !scanIssues.length && !diagIssues.length && !badRedirects.length) L.push('All clear — nothing flagged by uptime, scans, diagnostics, or redirect rules.');
   return { md: `${L.join('\n')}\n`, date };
 }
 
-$('#btn-triage').onclick = () => {
+$('#btn-triage').onclick = async () => {
   if (!Object.keys(state.health).length && !Object.keys(state.scan).length) { toast('Nothing scanned or probed yet — run an up-check or Scan first.', 'err'); return; }
-  const { md, date } = composeTriageMd();
+  let badRedirects = [];
+  try {
+    ({ bad: badRedirects } = await api('/api/tools/find-bad-redirects', { body: {} }));
+  } catch { /* rule check unavailable — triage still runs */ }
+  const { md, date } = composeTriageMd(badRedirects);
   downloadText(`dns-triage-${date}.md`, md);
   toast('Triage report downloaded.', 'ok');
   if (state.emailReady && confirm('Email the triage report too?')) emailMd(`DNS triage report — ${date}`, md);
@@ -1747,8 +1756,13 @@ const UP_BAD = (c) => c && c !== 'live' && c !== 'pending-zone';
 function upDot(domain) {
   const h = state.health[domain];
   if (!h) return '';
-  const color = h.class === 'live' ? 'var(--green)' : h.class === 'pending-zone' ? 'var(--dim)' : 'var(--red)';
-  return `<span style="color:${color}" title="${esc(h.class)}${h.detail ? ' — ' + esc(h.detail) : ''}">●</span>`;
+  if (h.class === 'live') return '<span style="color:var(--green)" title="live">●</span>';
+  if (h.class === 'pending-zone') return '<span style="color:var(--dim)" title="zone pending">●</span>';
+  // Down classes get an explicit badge on the row — a red dot doesn't say why.
+  const label = h.class === 'origin-error' ? `CF ${h.status || '52x'} origin`
+    : h.class === 'tls-error' ? 'TLS/cert'
+    : h.class + (h.status ? ` ${h.status}` : '');
+  return `<span class="badge none" title="${esc(h.detail || '')}">▼ ${esc(label)}</span>`;
 }
 
 function updateUpDots() {
