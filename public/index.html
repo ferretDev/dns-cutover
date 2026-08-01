@@ -289,7 +289,6 @@
       <div><label>Postmark server token (for emailed reports)</label><input id="cfg-POSTMARK_TOKEN" type="password" autocomplete="off"></div>
       <div><label>Report sender (verified Postmark signature)</label><input id="cfg-REPORT_FROM" autocomplete="off" placeholder="reports@yourdomain.com"></div>
       <div><label>Default report recipient</label><input id="cfg-REPORT_TO" autocomplete="off" placeholder="you@yourdomain.com"></div>
-      <div><label>Scheduled drift report — every N hours (0 = off; server emails triage unattended)</label><input id="cfg-REPORT_SCHEDULE_HOURS" autocomplete="off" placeholder="24"></div>
     </div>
     <button class="primary" id="btn-save-cfg">Save keys</button>
     <button id="btn-test-cfg">Test connections</button>
@@ -835,7 +834,7 @@ async function api(path, opts = {}) {
 
 /* ---------- settings ---------- */
 
-const CFG_KEYS = ['PROVIDER', 'ENOM_UID', 'ENOM_PW', 'ENOM_ENV', 'GODADDY_KEY', 'GODADDY_SECRET', 'NAMECHEAP_USER', 'NAMECHEAP_KEY', 'NAMECHEAP_CLIENT_IP', 'PORKBUN_KEY', 'PORKBUN_SECRET', 'CF_API_TOKEN', 'CF_ACCOUNT_ID', 'POSTMARK_TOKEN', 'REPORT_FROM', 'REPORT_TO', 'REPORT_SCHEDULE_HOURS'];
+const CFG_KEYS = ['PROVIDER', 'ENOM_UID', 'ENOM_PW', 'ENOM_ENV', 'GODADDY_KEY', 'GODADDY_SECRET', 'NAMECHEAP_USER', 'NAMECHEAP_KEY', 'NAMECHEAP_CLIENT_IP', 'PORKBUN_KEY', 'PORKBUN_SECRET', 'CF_API_TOKEN', 'CF_ACCOUNT_ID', 'POSTMARK_TOKEN', 'REPORT_FROM', 'REPORT_TO'];
 const SELECT_KEYS = new Set(['PROVIDER', 'ENOM_ENV']);
 
 function syncProviderFields() {
