@@ -1005,6 +1005,91 @@ const routes = {
     return { results };
   },
 
+  'POST /api/tools/search-records': async (req) => {
+    const { query = '', field = 'both', type = '', regex = false, proxied = 'any' } = await readBody(req);
+    if (!query.trim() && !type) throw new Error('Give a query and/or a type filter');
+    let matcher;
+    if (regex) {
+      let re;
+      try { re = new RegExp(query, 'i'); } catch (e) { throw new Error(`Bad regex: ${e.message}`); }
+      matcher = (s) => re.test(s);
+    } else {
+      const q = query.toLowerCase();
+      matcher = (s) => s.toLowerCase().includes(q);
+    }
+    const zones = await cloudflare.listZones();
+    const found = [];
+    await pooled(zones, 8, async (z) => {
+      const recs = await cloudflare.listRecords(z.id);
+      for (const r of recs) {
+        if (type && r.type !== type) continue;
+        if (proxied === 'yes' && !r.proxied) continue;
+        if (proxied === 'no' && r.proxied) continue;
+        if (query.trim()) {
+          const inName = field !== 'content' && matcher(r.name);
+          const inContent = field !== 'name' && matcher(String(r.content ?? ''));
+          if (!inName && !inContent) continue;
+        }
+        found.push({ domain: z.name, zoneId: z.id, recordId: r.id, type: r.type, name: r.name, content: r.content, proxied: !!r.proxied });
+      }
+    });
+    found.sort((a, b) => a.name.localeCompare(b.name));
+    return { found: found.slice(0, 500), total: found.length, zonesScanned: zones.length };
+  },
+
+  'POST /api/tools/records-bulk': async (req) => {
+    const { action, items = [], value } = await readBody(req);
+    if (!['replace-content', 'proxy-on', 'proxy-off', 'delete'].includes(action)) throw new Error(`Unknown action "${action}"`);
+    if (action === 'replace-content' && !value?.trim()) throw new Error('Replacement value required');
+    const results = await pooled(items, 6, async (it) => {
+      if (action === 'delete') {
+        await cloudflare.deleteRecord(it.zoneId, it.recordId);
+      } else if (action === 'replace-content') {
+        const content = it.type === 'TXT' && !/^".*"$/.test(value) ? `"${value}"` : value;
+        await cloudflare.updateRecord(it.zoneId, it.recordId, { content });
+      } else {
+        await cloudflare.updateRecord(it.zoneId, it.recordId, { proxied: action === 'proxy-on' });
+      }
+      return { name: it.name, ok: true };
+    });
+    return { results };
+  },
+
+  'POST /api/tools/find-dangling': async () => {
+    const TAKEOVER_VENDORS = ['github.io', 'herokuapp.com', 'azurewebsites.net', 'cloudapp.net', 'trafficmanager.net',
+      'netlify.app', 'vercel.app', 'myshopify.com', 'surge.sh', 'bitbucket.io', 'ghost.io', 'pantheonsite.io',
+      'wpengine.com', 's3.amazonaws.com'];
+    // A target is alive if it answers ANY of A/AAAA, TXT, or CNAME — DKIM and
+    // verification targets are TXT-only names that a plain lookup() would misread as dead.
+    const targetResolves = async (t) => {
+      try { await dnsp.lookup(t); return true; } catch { /* try next */ }
+      try { if ((await dnsp.resolveTxt(t)).length) return true; } catch { /* try next */ }
+      try { if ((await dnsp.resolveCname(t)).length) return true; } catch { /* dead */ }
+      return false;
+    };
+    const zones = await cloudflare.listZones();
+    const found = [];
+    await pooled(zones, 6, async (z) => {
+      const recs = await cloudflare.listRecords(z.id);
+      for (const r of recs.filter((x) => x.type === 'CNAME')) {
+        const target = String(r.content || '').toLowerCase().replace(/\.$/, '');
+        if (!target) continue;
+        if (await targetResolves(target)) continue;
+        const vendor = TAKEOVER_VENDORS.find((v) => target === v || target.endsWith(`.${v}`));
+        const isDkim = r.name.includes('._domainkey.');
+        found.push({
+          domain: z.name, zoneId: z.id, recordId: r.id, type: 'CNAME',
+          name: r.name, content: target, proxied: !!r.proxied,
+          risk: vendor ? `TAKEOVER RISK (${vendor})`
+            : isDkim ? 'broken DKIM — enable DKIM at the mail tenant, do NOT delete'
+            : 'dead target',
+        });
+      }
+    });
+    found.sort((a, b) => (b.risk.startsWith('TAKEOVER') ? 1 : 0) - (a.risk.startsWith('TAKEOVER') ? 1 : 0) || a.name.localeCompare(b.name));
+    return { found, zonesScanned: zones.length };
+  },
+
   'POST /api/tools/find-bad-redirects': async () => {
     const zones = await cloudflare.listZones();
     const bad = [];

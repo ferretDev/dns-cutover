@@ -275,6 +275,29 @@
       </div>
     </div>
     <div style="margin-bottom:18px">
+      <b>🔎 Record search &amp; bulk edit</b>
+      <div style="color:var(--dim);font-size:12px;margin:2px 0 8px">Search every zone by record name/content, then act on the selection in bulk — replace content (repoint a dead IP fleet-wide), flip proxy state, or delete after review. Nothing changes without your selection + confirm.</div>
+      <input id="rs-q" placeholder="query — IP, hostname, fragment…" style="background:var(--inset);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:6px 10px;font-family:var(--mono);font-size:12.5px;width:230px">
+      <select id="rs-field" style="background:var(--inset);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:6px;font-size:12.5px">
+        <option value="both">name + content</option><option value="name">name only</option><option value="content">content only</option>
+      </select>
+      <select id="rs-type" style="background:var(--inset);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:6px;font-size:12.5px">
+        <option value="">any type</option>${['A', 'AAAA', 'CNAME', 'MX', 'TXT', 'SRV', 'NS'].map((t) => `<option>${t}</option>`).join('')}
+      </select>
+      <select id="rs-prox" style="background:var(--inset);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:6px;font-size:12.5px">
+        <option value="any">any proxy</option><option value="yes">☁ proxied</option><option value="no">DNS-only</option>
+      </select>
+      <label style="font-size:12px;color:var(--dim)"><input type="checkbox" id="rs-regex"> regex</label>
+      <button class="small" id="btn-rs">Find</button>
+      <div id="rs-results" style="margin-top:8px"></div>
+    </div>
+    <div style="margin-bottom:18px">
+      <b>🕸 Dangling CNAME sweep</b>
+      <div style="color:var(--dim);font-size:12px;margin:2px 0 8px">Finds CNAMEs whose targets no longer resolve — dead vendors and decommissioned services. Targets on claimable platforms (github.io, herokuapp, azure, S3…) are flagged as subdomain-takeover risks. Review → delete.</div>
+      <button class="small" id="btn-dangling">Find dangling CNAMEs</button>
+      <div id="dangling-results" style="margin-top:8px"></div>
+    </div>
+    <div style="margin-bottom:18px">
       <b>🚚 Registrar transfers</b>
       <div style="color:var(--dim);font-size:12px;margin:2px 0 8px">Per-domain transfer readiness: registrar lock + WHOIS privacy live from Enom, transfer progress from public RDAP (registrar of record, pendingTransfer). EPP codes are emailed to the registrant — the board tracks when. "Prep" = unlock + privacy off + EPP email in one shot.</div>
       <button class="small" id="btn-transfer-board">Load board (selected / visible)</button>
@@ -458,8 +481,9 @@ function renderDash() {
           : '<button class="small" id="btn-queue" style="flex:1">🎛 Queue</button>'}
       </span>
       <span class="trow" style="justify-content:flex-end">
-        <input type="range" id="pb-max" min="1" max="50" value="${state.pbMax}" style="width:110px" ${state.queueRunning ? 'disabled' : ''}>
-        <span style="font-size:11px;color:var(--dim);white-space:nowrap" id="pb-max-lbl">queue window ≤${state.pbMax} pending</span>
+        <button class="small" id="btn-nudge" title="Ask Cloudflare to re-check NS delegation on every pending zone right now">⏫ nudge</button>
+        <input type="range" id="pb-max" min="1" max="50" value="${state.pbMax}" style="width:90px" ${state.queueRunning ? 'disabled' : ''}>
+        <span style="font-size:11px;color:var(--dim);white-space:nowrap" id="pb-max-lbl">queue ≤${state.pbMax} pending</span>
       </span>
     </div>`,
   ].join('');
@@ -498,7 +522,16 @@ function renderDash() {
   $('#pb-max').oninput = (e) => {
     state.pbMax = Number(e.target.value);
     localStorage.setItem('pbMax', state.pbMax);
-    $('#pb-max-lbl').textContent = `queue window ≤${state.pbMax} pending`;
+    $('#pb-max-lbl').textContent = `queue ≤${state.pbMax} pending`;
+  };
+  $('#btn-nudge').onclick = async () => {
+    const btn = $('#btn-nudge');
+    btn.disabled = true;
+    try {
+      const r = await api('/api/activation-check', { body: {} });
+      toast(`Activation re-check requested on ${r.checked}/${r.pending} pending zone(s).`, 'ok');
+    } catch (err) { toast(err.message, 'err'); }
+    btn.disabled = false;
   };
 }
 
@@ -1502,6 +1535,104 @@ $('#btn-redirect-wire').onclick = async () => {
   }
   box.insertAdjacentHTML('beforeend', '<div style="color:var(--dim);margin-top:4px">Done. Verify with 🔦 probe or the uptime board once the edge cert is live.</div>');
   btn.disabled = false;
+};
+
+/* ---------- record search & bulk edit ---------- */
+
+let rsRows = [];
+
+function renderRsResults() {
+  const box = $('#rs-results');
+  if (!rsRows.length) { box.innerHTML = '<span style="color:var(--dim);font-size:12px">No matches.</span>'; return; }
+  box.innerHTML = `
+    <table>
+      <thead><tr><th><input type="checkbox" class="rs-all"></th><th>Domain</th><th>Type</th><th>Name</th><th>Content</th><th>☁</th></tr></thead>
+      <tbody>${rsRows.map((r, i) => `
+        <tr>
+          <td class="sel"><input type="checkbox" class="rs-row" data-i="${i}"></td>
+          <td style="font-family:var(--mono);font-size:12px">${esc(r.domain)}</td>
+          <td style="font-family:var(--mono);font-size:12px;color:var(--blue)">${esc(r.type)}</td>
+          <td style="font-family:var(--mono);font-size:12px;word-break:break-all">${esc(r.name)}</td>
+          <td style="font-family:var(--mono);font-size:12px;word-break:break-all">${esc(r.content)}</td>
+          <td style="font-family:var(--mono);font-size:12px">${r.proxied ? '☁' : ''}</td>
+        </tr>`).join('')}
+      </tbody>
+    </table>
+    <div style="display:flex;gap:6px;margin-top:8px;flex-wrap:wrap">
+      <button class="small primary rs-act" data-act="replace-content" disabled>✎ Replace content…</button>
+      <button class="small rs-act" data-act="proxy-on" disabled>☁ Proxy on</button>
+      <button class="small rs-act" data-act="proxy-off" disabled>⬜ Proxy off</button>
+      <button class="small danger rs-act" data-act="delete" disabled>🗑 Delete…</button>
+      <span class="rs-count" style="color:var(--dim);font-size:12px;align-self:center"></span>
+    </div>`;
+  const refresh = () => {
+    const n = $$('.rs-row:checked', box).length;
+    $$('.rs-act', box).forEach((b) => { b.disabled = !n; });
+    $('.rs-count', box).textContent = n ? `${n} selected` : '';
+  };
+  $('.rs-all', box).onchange = (e) => { $$('.rs-row', box).forEach((cb) => { cb.checked = e.target.checked; }); refresh(); };
+  $$('.rs-row', box).forEach((cb) => { cb.onchange = refresh; });
+  $$('.rs-act', box).forEach((b) => { b.onclick = () => rsBulk(b.dataset.act); });
+}
+
+async function rsBulk(action) {
+  const box = $('#rs-results');
+  const items = $$('.rs-row:checked', box).map((cb) => rsRows[Number(cb.dataset.i)]);
+  if (!items.length) return;
+  const zones = new Set(items.map((i) => i.domain)).size;
+  let value;
+  if (action === 'replace-content') {
+    value = prompt(`New content for ${items.length} record(s) across ${zones} zone(s):`, items[0].content);
+    if (!value?.trim()) return;
+  }
+  if (action === 'delete') {
+    if (!confirm(`DELETE ${items.length} record(s) across ${zones} zone(s)?\n\nThis cannot be undone.`)) return;
+    if (!confirm(`Really sure? Final confirm to delete ${items.length} record(s).`)) return;
+  }
+  try {
+    const { results } = await api('/api/tools/records-bulk', { body: { action, items, value } });
+    const bad = results.filter((r) => !r || r.error || r.ok === false);
+    bad.length ? toast(`${bad.length} failed: ${bad[0].error || ''}`, 'err') : toast(`${results.length} record(s) ${action === 'delete' ? 'deleted' : 'updated'}.`, 'ok');
+    $('#btn-rs').click();
+  } catch (err) { toast(err.message, 'err'); }
+}
+
+$('#btn-rs').onclick = async () => {
+  const box = $('#rs-results');
+  box.innerHTML = '<span class="loading">Searching every zone…</span>';
+  try {
+    const { found, total, zonesScanned } = await api('/api/tools/search-records', {
+      body: {
+        query: $('#rs-q').value,
+        field: $('#rs-field').value,
+        type: $('#rs-type').value,
+        proxied: $('#rs-prox').value,
+        regex: $('#rs-regex').checked,
+      },
+    });
+    rsRows = found;
+    renderRsResults();
+    toast(`Scanned ${zonesScanned} zones — ${total} match(es)${total > found.length ? ` (showing first ${found.length})` : ''}.`);
+  } catch (err) { box.innerHTML = `<div class="errors">✗ ${esc(err.message)}</div>`; }
+};
+
+$('#btn-dangling').onclick = async () => {
+  const box = $('#dangling-results');
+  box.innerHTML = '<span class="loading">Resolving every CNAME target…</span>';
+  try {
+    const { found, zonesScanned } = await api('/api/tools/find-dangling', { body: {} });
+    toast(`Scanned ${zonesScanned} zones — ${found.length} dangling CNAME(s).`);
+    toolResultsTable(box, found,
+      [{ key: 'name', label: 'Record' }, { key: 'content', label: 'Dead target' }, { key: 'risk', label: 'Classification' }],
+      '🗑 Delete selected',
+      async (selected) => {
+        if (!confirm(`Delete ${selected.length} dangling CNAME(s)? This cannot be undone.`)) return;
+        const { results } = await api('/api/tools/records-bulk', { body: { action: 'delete', items: selected } });
+        const bad = results.filter((r) => !r || r.error || r.ok === false);
+        bad.length ? toast(`${bad.length} failed: ${bad[0].error || ''}`, 'err') : toast(`${results.length} dangling record(s) removed.`, 'ok');
+        $('#btn-dangling').click();
+      });
+  } catch (err) { box.innerHTML = `<div class="errors">✗ ${esc(err.message)}</div>`; }
 };
 
 /* ---------- registrar transfer board ---------- */
