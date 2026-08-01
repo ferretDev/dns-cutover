@@ -5,7 +5,7 @@
  */
 import { createServer } from 'node:http';
 import { promises as dnsp } from 'node:dns';
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as enom from './lib/enom.js';
@@ -69,6 +69,39 @@ function assertZone(zone, domain) {
   return zone;
 }
 
+/**
+ * SPF lookup-tree audit: >10 DNS-querying mechanisms = permerror (silent
+ * deliverability death). Also finds includes that no longer resolve.
+ */
+async function spfLookupAudit(domain, cfRecords) {
+  const apexSpf = cfRecords.find((r) => r.type === 'TXT' && r.name === domain && /^v=spf1/i.test(r.content));
+  if (!apexSpf) return null;
+  let lookups = 0;
+  const dead = [];
+  const seen = new Set();
+  const walk = async (spf, depth) => {
+    if (depth > 5) return;
+    for (const term of spf.split(/\s+/)) {
+      const m = term.match(/^[+~\-?]?(include|redirect|a|mx|exists|ptr)([:=](.*))?$/i);
+      if (!m) continue;
+      lookups++;
+      const mech = m[1].toLowerCase();
+      const arg = m[3];
+      if ((mech === 'include' || mech === 'redirect') && arg && !seen.has(arg)) {
+        seen.add(arg);
+        try {
+          const txts = (await dnsp.resolveTxt(arg)).map((t) => t.join(''));
+          const sub = txts.find((t) => /^v=spf1/i.test(t));
+          if (sub) await walk(sub, depth + 1);
+          else dead.push(arg);
+        } catch { dead.push(arg); }
+      }
+    }
+  };
+  await walk(apexSpf.content, 0);
+  return { lookups, dead };
+}
+
 /** Full state for one domain: both zones, NS, aligned rows. */
 async function domainState(domain) {
   const prov = activeProvider();
@@ -118,11 +151,25 @@ async function domainState(domain) {
     && cfNs.every((n) => enomNs.nameservers.includes(n))
     && enomNs.nameservers.length === cfNs.length;
 
+  const mail = analyzeMail(enomRecords, cfRecords, domain);
+  if (mail.provider) {
+    try {
+      const spf = await spfLookupAudit(domain, cfRecords);
+      if (spf) {
+        mail.checks.push({ label: 'SPF DNS lookups ≤ 10', required: true, ok: spf.lookups <= 10, inEnom: true, detail: `${spf.lookups} lookup(s)${spf.lookups > 10 ? ' — permerror, trim includes' : ''}` });
+        if (spf.dead.length) {
+          mail.checks.push({ label: 'SPF includes resolve', required: true, ok: false, inEnom: true, detail: `dead include(s): ${spf.dead.join(', ')}` });
+        }
+        mail.gaps = mail.checks.filter((c) => c.required && !c.ok).length;
+      }
+    } catch { /* SPF audit is best-effort */ }
+  }
+
   return {
     domain,
     provider: prov.name,
     rows: buildRows(enomRecords, cfRecords),
-    mail: analyzeMail(enomRecords, cfRecords, domain),
+    mail,
     rollback: getRollbacks()[domain] || null,
     redirects,
     cfRedirects,
@@ -586,7 +633,7 @@ async function runPlaybook(domain, config = {}) {
     else {
       await activeProvider().setNameservers(domain, s.cfNs);
       saveRollback(domain, { previousNs: s.enomNs, newNs: s.cfNs, at: new Date().toISOString() });
-      add('cutover', 'ok', `NS → ${s.cfNs.join(', ')} (rollback saved)`);
+      add('cutover', 'ok', `NS → ${s.cfNs.join(', ')} (rollback saved; keep the old origin/host online ≥48h — cached resolvers still send traffic there)`);
       s = await domainState(domain);
     }
   } catch (err) {
@@ -595,6 +642,100 @@ async function runPlaybook(domain, config = {}) {
   }
   return { domain, steps, state: s };
 }
+
+/* ---------- report email + unattended drift schedule ---------- */
+
+async function sendReportEmail(subject, markdown, html, to) {
+  if (!process.env.POSTMARK_TOKEN) throw new Error('POSTMARK_TOKEN not set — add it in ⚙ API Keys');
+  const from = process.env.REPORT_FROM;
+  if (!from) throw new Error('REPORT_FROM not set — must be a verified Postmark sender signature');
+  const recipient = (to || process.env.REPORT_TO || '').trim();
+  if (!recipient) throw new Error('No recipient — pass one or set REPORT_TO in ⚙ API Keys');
+  const escHtml = (s) => s.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+  const res = await fetch('https://api.postmarkapp.com/email', {
+    method: 'POST',
+    headers: {
+      'X-Postmark-Server-Token': process.env.POSTMARK_TOKEN,
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    },
+    body: JSON.stringify({
+      From: from,
+      To: recipient,
+      Subject: subject,
+      TextBody: markdown,
+      HtmlBody: html || `<pre style="font-family:ui-monospace,Menlo,monospace;font-size:13px;white-space:pre-wrap">${escHtml(markdown)}</pre>`,
+      MessageStream: 'outbound',
+    }),
+    signal: AbortSignal.timeout(15_000),
+  });
+  const j = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(`Postmark: ${j.Message || `HTTP ${res.status}`}`);
+  return { ok: true, to: recipient, messageId: j.MessageID };
+}
+
+const SCHEDULE_FILE = join(root, 'schedule.json');
+const readSchedule = () => { try { return JSON.parse(readFileSync(SCHEDULE_FILE, 'utf8')); } catch { return {}; } };
+const writeSchedule = (o) => writeFileSync(SCHEDULE_FILE, JSON.stringify(o) + '\n');
+
+/** Fleet drift + uptime sweep, composed server-side so it can run with no browser. */
+async function scheduledDriftReport() {
+  const prov = activeProvider();
+  const [domains, zones] = await Promise.all([prov.listDomains(), cloudflare.listZones()]);
+  const states = (await pooled(domains, 5, async (d) => {
+    const s = await domainState(d);
+    return {
+      domain: d,
+      zone: s.zone?.status ?? null,
+      pointed: s.pointedAtCf,
+      missing: s.rows.filter((r) => r.status === 'enom-only').length,
+      mailGaps: s.mail.gaps || 0,
+      errors: s.errors.length,
+    };
+  })).filter((r) => r && r.domain);
+  const ups = (await pooled(zones.filter((z) => z.status === 'active'), 8, async (z) =>
+    ({ domain: z.name, ...(await probeHost(z.name)) }))).filter(Boolean);
+  const downs = ups.filter((u) => PROBE_ORDER[u.class] < PROBE_ORDER.live && u.class !== 'pending-zone');
+  const issues = states.filter((s) => s.missing || s.mailGaps || s.errors || !s.zone);
+  const date = new Date().toISOString().slice(0, 10);
+  const L = [`# Scheduled DNS drift report — ${date}`, '',
+    `${domains.length} domain(s) · ${zones.length} zones · ${ups.filter((u) => u.class === 'live').length} up · ${downs.length} down`, ''];
+  if (downs.length) {
+    L.push(`## Down (${downs.length})`, '');
+    downs.forEach((d) => L.push(`- ${d.domain} — ${d.class}${d.status ? ` ${d.status}` : ''}${d.detail ? ` — ${d.detail}` : ''}`));
+    L.push('');
+  }
+  if (issues.length) {
+    L.push(`## Drift / gaps (${issues.length})`, '');
+    issues.forEach((s) => {
+      const bits = [];
+      if (!s.zone) bits.push('no CF zone');
+      if (s.missing) bits.push(`${s.missing} record(s) missing`);
+      if (s.mailGaps) bits.push(`${s.mailGaps} mail gap(s)`);
+      if (s.errors) bits.push('source read errors');
+      L.push(`- ${s.domain} — ${bits.join(' · ')}`);
+    });
+    L.push('');
+  }
+  if (!downs.length && !issues.length) L.push('All clear — no drift, no downs.');
+  const md = `${L.join('\n')}\n`;
+  return { md, subject: `DNS drift report — ${downs.length} down, ${issues.length} with drift — ${date}`, clear: !downs.length && !issues.length };
+}
+
+setInterval(async () => {
+  const hours = Number(process.env.REPORT_SCHEDULE_HOURS || 0);
+  if (!hours) return;
+  const last = readSchedule().lastRun || 0;
+  if (Date.now() - last < hours * 3600_000) return;
+  writeSchedule({ lastRun: Date.now() }); // claim before running so overlapping ticks can't double-fire
+  try {
+    const { md, subject } = await scheduledDriftReport();
+    await sendReportEmail(subject, md);
+    console.log(`[schedule] drift report emailed (${subject})`);
+  } catch (e) {
+    console.error(`[schedule] drift report failed: ${e.message}`);
+  }
+}, 60_000);
 
 /* ---------- routes ---------- */
 
@@ -638,32 +779,7 @@ const routes = {
   'POST /api/email-report': async (req) => {
     const { subject, markdown, html, to } = await readBody(req);
     if (!subject || !markdown) throw new Error('subject and markdown are required');
-    if (!process.env.POSTMARK_TOKEN) throw new Error('POSTMARK_TOKEN not set — add it in ⚙ API Keys');
-    const from = process.env.REPORT_FROM;
-    if (!from) throw new Error('REPORT_FROM not set — must be a verified Postmark sender signature');
-    const recipient = (to || process.env.REPORT_TO || '').trim();
-    if (!recipient) throw new Error('No recipient — pass one or set REPORT_TO in ⚙ API Keys');
-    const escHtml = (s) => s.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
-    const res = await fetch('https://api.postmarkapp.com/email', {
-      method: 'POST',
-      headers: {
-        'X-Postmark-Server-Token': process.env.POSTMARK_TOKEN,
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-      },
-      body: JSON.stringify({
-        From: from,
-        To: recipient,
-        Subject: subject,
-        TextBody: markdown,
-        HtmlBody: html || `<pre style="font-family:ui-monospace,Menlo,monospace;font-size:13px;white-space:pre-wrap">${escHtml(markdown)}</pre>`,
-        MessageStream: 'outbound',
-      }),
-      signal: AbortSignal.timeout(15_000),
-    });
-    const j = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(`Postmark: ${j.Message || `HTTP ${res.status}`}`);
-    return { ok: true, to: recipient, messageId: j.MessageID };
+    return sendReportEmail(subject, markdown, html, to);
   },
 
   'GET /api/pending-status': async () => {
