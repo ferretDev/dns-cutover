@@ -199,6 +199,15 @@
   details summary { transition: color var(--tr); }
   details summary:hover { color: var(--text); }
 
+  /* tools drawer cards */
+  .toolcard { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius-sm); margin-bottom: 8px; overflow: hidden; }
+  .toolcard > summary { padding: 10px 14px; cursor: pointer; list-style: none; font-size: 13.5px; transition: background var(--tr); }
+  .toolcard > summary::before { content: "▸"; color: var(--dim); margin-right: 8px; font-size: 11px; }
+  .toolcard[open] > summary::before { content: "▾"; }
+  .toolcard > summary:hover { background: #161c29; }
+  .toolcard[open] > summary { border-bottom: 1px solid var(--border-soft); }
+  .toolcard .tool-body { padding: 12px 14px; }
+
   /* toast */
   #toast { position: fixed; bottom: 18px; right: 18px; display: flex; flex-direction: column; gap: 8px; z-index: 60; }
   .toastmsg {
@@ -260,8 +269,9 @@
   </section>
 
   <section id="tools" style="display:none;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:16px;margin-bottom:16px">
-    <div style="margin-bottom:18px">
-      <b>Playbook editor</b>
+    <div style="font-size:12px;color:var(--dim);margin:2px 2px 10px">Fleet tools — expand one to use it. Find → review → apply; nothing runs without your confirm.</div>
+    <details class="toolcard"><summary><b>Playbook editor</b></summary><div class="tool-body">
+      
       <div style="color:var(--dim);font-size:12px;margin:2px 0 8px">Playbooks define which steps a run performs. Built-ins can't be edited — select one, rename, and Save to create your own variant. Cutover always forces verification.</div>
       <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">
         <select id="pbe-select" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:5px 6px;font-size:12px"></select>
@@ -273,9 +283,9 @@
       <div style="margin-top:8px;font-size:12px;color:var(--dim)">un-proxy patterns:
         <input id="pbe-patterns" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:4px 8px;font-family:var(--mono);font-size:12px;width:300px" placeholder="pm-bounces, _domainkey, dkim">
       </div>
-    </div>
-    <div style="margin-bottom:18px">
-      <b>🔎 Record search &amp; bulk edit</b>
+    </div></details>
+    <details class="toolcard"><summary><b>🔎 Record search &amp; bulk edit</b></summary><div class="tool-body">
+      
       <div style="color:var(--dim);font-size:12px;margin:2px 0 8px">Search every zone by record name/content, then act on the selection in bulk — replace content (repoint a dead IP fleet-wide), flip proxy state, or delete after review. Nothing changes without your selection + confirm.</div>
       <input id="rs-q" placeholder="query — IP, hostname, fragment…" style="background:var(--inset);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:6px 10px;font-family:var(--mono);font-size:12.5px;width:230px">
       <select id="rs-field" style="background:var(--inset);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:6px;font-size:12.5px">
@@ -290,23 +300,23 @@
       <label style="font-size:12px;color:var(--dim)"><input type="checkbox" id="rs-regex"> regex</label>
       <button class="small" id="btn-rs">Find</button>
       <div id="rs-results" style="margin-top:8px"></div>
-    </div>
-    <div style="margin-bottom:18px">
-      <b>🕸 Dangling CNAME sweep</b>
+    </div></details>
+    <details class="toolcard"><summary><b>🕸 Dangling CNAME sweep</b></summary><div class="tool-body">
+      
       <div style="color:var(--dim);font-size:12px;margin:2px 0 8px">Finds CNAMEs whose targets no longer resolve — dead vendors and decommissioned services. Targets on claimable platforms (github.io, herokuapp, azure, S3…) are flagged as subdomain-takeover risks. Review → delete.</div>
       <button class="small" id="btn-dangling">Find dangling CNAMEs</button>
       <div id="dangling-results" style="margin-top:8px"></div>
-    </div>
-    <div style="margin-bottom:18px">
-      <b>🚚 Registrar transfers</b>
+    </div></details>
+    <details class="toolcard"><summary><b>🚚 Registrar transfers</b></summary><div class="tool-body">
+      
       <div style="color:var(--dim);font-size:12px;margin:2px 0 8px">Per-domain transfer readiness: registrar lock + WHOIS privacy live from Enom, transfer progress from public RDAP (registrar of record, pendingTransfer). EPP codes are emailed to the registrant — the board tracks when. "Prep" = unlock + privacy off + EPP email in one shot.</div>
       <button class="small" id="btn-transfer-board">Load board (selected / visible)</button>
       <button class="small primary" id="btn-transfer-prep" disabled>🚚 Prep checked for transfer</button>
       <span id="transfer-summary" style="font-size:12px;color:var(--dim)"></span>
       <div id="transfer-results" style="margin-top:8px"></div>
-    </div>
-    <div style="margin-bottom:18px">
-      <b>↪ Convert domain to redirect</b>
+    </div></details>
+    <details class="toolcard"><summary><b>↪ Convert domain to redirect</b></summary><div class="tool-body">
+      
       <div style="color:var(--dim);font-size:12px;margin:2px 0 8px">Wire a whole domain to redirect to a target URL — creates proxied placeholder records where needed and Single Redirect rules for the chosen hosts. Idempotent: existing identical rules are left alone.</div>
       <input id="rd-domain" placeholder="example.com" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:5px 8px;font-family:var(--mono);font-size:12px;width:190px">
       <span style="color:var(--dim);font-size:12px">→</span>
@@ -320,38 +330,38 @@
       <label style="font-size:12px;color:var(--dim)"><input type="checkbox" class="rd-host" value="*" checked> *</label>
       <button class="small primary" id="btn-redirect-wire">↪ Wire it up</button>
       <div id="redirect-wire-results" style="margin-top:8px;font-family:var(--mono);font-size:12px"></div>
-    </div>
-    <div style="margin-bottom:18px">
-      <b>Missing @ / www records</b>
+    </div></details>
+    <details class="toolcard"><summary><b>Missing @ / www records</b></summary><div class="tool-body">
+      
       <div style="color:var(--dim);font-size:12px;margin:2px 0 8px">A <code>*</code> wildcard does NOT cover the apex — a zone with only <code>*</code> leaves <code>@</code> unresolvable. Finds zones missing <code>@</code> (mirror from <code>*</code>, else <code>www</code>) or missing <code>www</code> with no wildcard (mirror from <code>@</code>), probing the source first so you never clone a dead value. Zones with nothing to mirror get clone-candidate recommendations.</div>
       <button class="small" id="btn-find-apex">Find missing @ / www</button>
       <div id="apex-results" style="margin-top:8px"></div>
-    </div>
-    <div style="margin-bottom:18px">
-      <b>Un-proxy records by pattern</b>
+    </div></details>
+    <details class="toolcard"><summary><b>Un-proxy records by pattern</b></summary><div class="tool-body">
+      
       <div style="color:var(--dim);font-size:12px;margin:2px 0 8px">Finds proxied (orange-cloud) records whose name contains the pattern, across every Cloudflare zone, and flips them to DNS-only. Mail-infrastructure hostnames (pm-bounces, dkim, mail…) must not be proxied.</div>
       <input id="unproxy-pattern" value="pm-bounces" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:5px 8px;font-family:var(--mono);font-size:12px;width:200px">
       <button class="small" id="btn-find-proxied">Find</button>
       <div id="unproxy-results" style="margin-top:8px"></div>
-    </div>
-    <div style="margin-bottom:18px">
-      <b>Source-truth IP audit</b>
+    </div></details>
+    <details class="toolcard"><summary><b>Source-truth IP audit</b></summary><div class="tool-body">
+      
       <div style="color:var(--dim);font-size:12px;margin:2px 0 8px">Pairs every A/AAAA record by name across Enom and Cloudflare and flags any whose IPs differ — the "cloned record got the wrong IP" detector. Note: for domains already cut over, Enom may be legitimately stale if you've since changed IPs in Cloudflare.</div>
       <button class="small" id="btn-verify-ips">Verify IPs against source</button>
       <div id="verifyip-results" style="margin-top:8px"></div>
-    </div>
-    <div style="margin-bottom:18px">
-      <b>Shared-IP audit</b>
+    </div></details>
+    <details class="toolcard"><summary><b>Shared-IP audit</b></summary><div class="tool-body">
+      
       <div style="color:var(--dim);font-size:12px;margin:2px 0 8px">Lists IPs used by A/AAAA records across multiple zones. Shared hosting is normal — but an IP appearing on a domain it shouldn't is how wrong-data clones show themselves. Informational; nothing is changed.</div>
       <button class="small" id="btn-shared-ips">Audit shared IPs</button>
       <div id="sharedip-results" style="margin-top:8px"></div>
-    </div>
-    <div>
-      <b>Fix misplaced DMARCs fleet-wide</b>
+    </div></details>
+    <details class="toolcard"><summary><b>Fix misplaced DMARCs fleet-wide</b></summary><div class="tool-body">
+      
       <div style="color:var(--dim);font-size:12px;margin:2px 0 8px">Finds v=DMARC1 policies published at <code>dmarc.domain</code> (no underscore — invisible to mail receivers) where no <code>_dmarc.domain</code> exists, and mirrors them to the correct name. Originals are left untouched.</div>
       <button class="small" id="btn-find-dmarc">Find misplaced DMARCs</button>
       <div id="dmarc-results" style="margin-top:8px"></div>
-    </div>
+    </div></details>
   </section>
 
   <div id="dash"></div>
