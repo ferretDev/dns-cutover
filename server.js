@@ -20,6 +20,7 @@ import { getRollbacks, saveRollback, markRolledBack } from './lib/rollback.js';
 import { getPlaybooks, savePlaybook, deletePlaybook } from './lib/playbooks.js';
 import { getTransfers, recordTransfer } from './lib/transfers.js';
 import * as spinup from './lib/spinupwp.js';
+import * as mainwp from './lib/mainwp.js';
 
 const root = dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 8899);
@@ -763,6 +764,41 @@ const routes = {
       else throw new Error(`Unknown action "${action}"`);
       return { id, ok: true };
     });
+    return { results };
+  },
+
+  'GET /api/wp/board': async () => {
+    const sites = await mainwp.listSites();
+    sites.sort((a, b) => (b.coreUpdates + b.pluginUpdates + b.themeUpdates) - (a.coreUpdates + a.pluginUpdates + a.themeUpdates) || a.url.localeCompare(b.url));
+    return {
+      sites,
+      totals: {
+        core: sites.reduce((n, s) => n + s.coreUpdates, 0),
+        plugins: sites.reduce((n, s) => n + s.pluginUpdates, 0),
+        themes: sites.reduce((n, s) => n + s.themeUpdates, 0),
+      },
+    };
+  },
+
+  'POST /api/wp/bulk': async (req) => {
+    const { what, siteIds = [] } = await readBody(req);
+    const kinds = what === 'all' ? ['plugins', 'themes', 'wordpress'] : [what];
+    if (!kinds.every((k) => ['plugins', 'themes', 'wordpress'].includes(k))) throw new Error(`Unknown update kind "${what}"`);
+    const results = [];
+    // Sequential per site — WP updates are heavy; don't stampede the dashboard.
+    for (const id of siteIds) {
+      const done = [];
+      const failed = [];
+      for (const kind of kinds) {
+        try {
+          await mainwp.updateSite(id, kind);
+          done.push(kind);
+        } catch (e) {
+          failed.push(`${kind}: ${e.message}`);
+        }
+      }
+      results.push({ id, ok: !failed.length, done, failed });
+    }
     return { results };
   },
 

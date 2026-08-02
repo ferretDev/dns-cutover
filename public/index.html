@@ -291,6 +291,9 @@
       <div><label>Report sender (verified Postmark signature)</label><input id="cfg-REPORT_FROM" autocomplete="off" placeholder="reports@yourdomain.com"></div>
       <div><label>Default report recipient</label><input id="cfg-REPORT_TO" autocomplete="off" placeholder="you@yourdomain.com"></div>
       <div><label>SpinupWP API token (🖥 Hosting board)</label><input id="cfg-SPINUPWP_TOKEN" type="password" autocomplete="off"></div>
+      <div><label>MainWP dashboard URL (📦 WP updates)</label><input id="cfg-MAINWP_URL" autocomplete="off" placeholder="https://mainwp.yourdomain.com"></div>
+      <div><label>MainWP consumer key</label><input id="cfg-MAINWP_KEY" type="password" autocomplete="off"></div>
+      <div><label>MainWP consumer secret</label><input id="cfg-MAINWP_SECRET" type="password" autocomplete="off"></div>
     </div>
     <button class="primary" id="btn-save-cfg">Save keys</button>
     <button id="btn-test-cfg">Test connections</button>
@@ -411,6 +414,19 @@
       <div id="spinup-servers" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px"></div>
       <div id="spinup-missing"></div>
       <div id="spinup-results"></div>
+      <div style="margin-top:22px;border-top:1px solid var(--border);padding-top:14px">
+        <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap">
+          <b>📦 WordPress updates</b> <span style="color:var(--dim);font-size:12px">via MainWP</span>
+          <span class="vsep"></span>
+          <button class="small" id="btn-wp-load">↻ Load updates</button>
+          <button class="small primary" id="wp-plugins" disabled>🔌 Update plugins</button>
+          <button class="small" id="wp-themes" disabled>🎨 Themes</button>
+          <button class="small" id="wp-core" disabled>⬆ Core</button>
+          <button class="small danger" id="wp-all" disabled>⚡ Everything</button>
+          <span id="wp-count" style="font-size:12px;color:var(--dim)"></span>
+        </div>
+        <div id="wp-results"></div>
+      </div>
     </div>
   </aside>
 
@@ -853,7 +869,7 @@ async function api(path, opts = {}) {
 
 /* ---------- settings ---------- */
 
-const CFG_KEYS = ['PROVIDER', 'ENOM_UID', 'ENOM_PW', 'ENOM_ENV', 'GODADDY_KEY', 'GODADDY_SECRET', 'NAMECHEAP_USER', 'NAMECHEAP_KEY', 'NAMECHEAP_CLIENT_IP', 'PORKBUN_KEY', 'PORKBUN_SECRET', 'CF_API_TOKEN', 'CF_ACCOUNT_ID', 'POSTMARK_TOKEN', 'REPORT_FROM', 'REPORT_TO', 'SPINUPWP_TOKEN'];
+const CFG_KEYS = ['PROVIDER', 'ENOM_UID', 'ENOM_PW', 'ENOM_ENV', 'GODADDY_KEY', 'GODADDY_SECRET', 'NAMECHEAP_USER', 'NAMECHEAP_KEY', 'NAMECHEAP_CLIENT_IP', 'PORKBUN_KEY', 'PORKBUN_SECRET', 'CF_API_TOKEN', 'CF_ACCOUNT_ID', 'POSTMARK_TOKEN', 'REPORT_FROM', 'REPORT_TO', 'SPINUPWP_TOKEN', 'MAINWP_URL', 'MAINWP_KEY', 'MAINWP_SECRET'];
 const SELECT_KEYS = new Set(['PROVIDER', 'ENOM_ENV']);
 
 function syncProviderFields() {
@@ -1595,6 +1611,69 @@ async function swBulk(action) {
 $('#sw-backup').onclick = () => swBulk('backup');
 $('#sw-php').onclick = () => swBulk('php');
 $('#sw-patch').onclick = () => swBulk('patch');
+
+/* ---- WordPress updates via MainWP ---- */
+
+let wpSites = [];
+
+function renderWpBoard(data) {
+  wpSites = data.sites;
+  const box = $('#wp-results');
+  const t = data.totals;
+  box.innerHTML = `
+    <div style="font-size:12.5px;color:var(--dim);margin-bottom:8px">Pending fleet-wide: <b style="color:${t.plugins ? 'var(--amber)' : 'var(--green)'}">${t.plugins} plugin</b> · <b style="color:${t.themes ? 'var(--amber)' : 'var(--green)'}">${t.themes} theme</b> · <b style="color:${t.core ? 'var(--red)' : 'var(--green)'}">${t.core} core</b></div>
+    <table>
+      <thead><tr><th><input type="checkbox" class="wp-all-cb"></th><th>Site</th><th>Core</th><th>Plugins</th><th>Themes</th><th></th></tr></thead>
+      <tbody>${data.sites.map((s, i) => `
+        <tr>
+          <td class="sel"><input type="checkbox" class="wp-row" data-i="${i}" ${s.offline ? 'disabled' : ''}></td>
+          <td style="font-family:var(--mono);font-size:12px">${esc(s.url.replace(/^https?:\/\//, ''))}${s.offline ? ' <span class="badge none">offline</span>' : ''}</td>
+          <td style="font-family:var(--mono);font-size:12px;color:${s.coreUpdates ? 'var(--red)' : 'var(--dim)'}">${s.coreUpdates || '—'}</td>
+          <td style="font-family:var(--mono);font-size:12px;color:${s.pluginUpdates ? 'var(--amber)' : 'var(--dim)'}">${s.pluginUpdates || '—'}</td>
+          <td style="font-family:var(--mono);font-size:12px;color:${s.themeUpdates ? 'var(--amber)' : 'var(--dim)'}">${s.themeUpdates || '—'}</td>
+          <td style="font-size:11px;color:var(--dim)">${(s.coreUpdates + s.pluginUpdates + s.themeUpdates) ? '' : '✓ current'}</td>
+        </tr>`).join('')}
+      </tbody>
+    </table>`;
+  const refresh = () => {
+    const n = $$('.wp-row:checked').length;
+    ['#wp-plugins', '#wp-themes', '#wp-core', '#wp-all'].forEach((id) => { $(id).disabled = !n; });
+    $('#wp-count').textContent = n ? `${n} selected` : '';
+  };
+  $('.wp-all-cb').onchange = (e) => { $$('.wp-row:not(:disabled)').forEach((cb) => { cb.checked = e.target.checked; }); refresh(); };
+  $$('.wp-row').forEach((cb) => { cb.onchange = refresh; });
+}
+
+$('#btn-wp-load').onclick = async () => {
+  const box = $('#wp-results');
+  box.innerHTML = '<div class="loading">Loading sites + pending updates from MainWP…</div>';
+  try {
+    const data = await api('/api/wp/board');
+    renderWpBoard(data);
+    toast(`MainWP: ${data.sites.length} site(s) — ${data.totals.plugins + data.totals.themes + data.totals.core} update(s) pending.`);
+  } catch (err) { box.innerHTML = `<div class="errors">✗ ${esc(err.message)}${err.message.includes('MAINWP') ? ' — configure MainWP in ⚙ API Keys' : ''}</div>`; }
+};
+
+async function wpBulk(what) {
+  const items = $$('.wp-row:checked').map((cb) => wpSites[Number(cb.dataset.i)]);
+  if (!items.length) return;
+  const label = { plugins: 'plugin updates', themes: 'theme updates', wordpress: 'WordPress core updates', all: 'ALL updates (plugins + themes + core)' }[what];
+  if (!confirm(`Run ${label} on ${items.length} site(s)?\n\nUpdates run sequentially per site via MainWP. Consider 💾 SpinupWP backups first.`)) return;
+  toast(`Updating ${items.length} site(s) — this can take a while…`);
+  try {
+    const { results } = await api('/api/wp/bulk', { body: { what, siteIds: items.map((i) => i.id) } });
+    for (const r of results) {
+      const site = wpSites.find((s) => s.id === r.id);
+      r.ok ? toast(`${site?.url || r.id}: ${r.done.join(', ')} updated`, 'ok')
+           : toast(`${site?.url || r.id}: ${r.failed.join('; ')}`, 'err');
+    }
+    $('#btn-wp-load').click();
+  } catch (err) { toast(err.message, 'err'); }
+}
+$('#wp-plugins').onclick = () => wpBulk('plugins');
+$('#wp-themes').onclick = () => wpBulk('themes');
+$('#wp-core').onclick = () => wpBulk('wordpress');
+$('#wp-all').onclick = () => wpBulk('all');
 
 /* ---------- playbook editor ---------- */
 
