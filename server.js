@@ -21,6 +21,7 @@ import { getPlaybooks, savePlaybook, deletePlaybook } from './lib/playbooks.js';
 import { getTransfers, recordTransfer } from './lib/transfers.js';
 import * as spinup from './lib/spinupwp.js';
 import * as mainwp from './lib/mainwp.js';
+import { generateInsights } from './lib/claude.js';
 
 const root = dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 8899);
@@ -714,6 +715,12 @@ const routes = {
   },
 
   'GET /api/domain': async (req, res, domain) => domainState(domain),
+
+  'POST /api/insights': async (req) => {
+    const { context, focus } = await readBody(req);
+    if (!context?.trim()) throw new Error('No context — run a Scan (and ideally an up-check) first so there is data to analyze.');
+    return generateInsights(context, focus);
+  },
 
   'POST /api/email-report': async (req) => {
     const { subject, markdown, html, to } = await readBody(req);

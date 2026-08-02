@@ -294,6 +294,7 @@
       <div><label>MainWP dashboard URL (📦 WP updates)</label><input id="cfg-MAINWP_URL" autocomplete="off" placeholder="https://mainwp.yourdomain.com"></div>
       <div><label>MainWP consumer key</label><input id="cfg-MAINWP_KEY" type="password" autocomplete="off"></div>
       <div><label>MainWP consumer secret</label><input id="cfg-MAINWP_SECRET" type="password" autocomplete="off"></div>
+      <div><label>Anthropic API key (✨ AI insights)</label><input id="cfg-ANTHROPIC_API_KEY" type="password" autocomplete="off"></div>
     </div>
     <button class="primary" id="btn-save-cfg">Save keys</button>
     <button id="btn-test-cfg">Test connections</button>
@@ -445,6 +446,7 @@
     <button class="small" id="btn-report" title="Markdown report for selected (or visible) domains from current scan/probe/diagnostic data">📄 Report</button>
     <button class="small" id="btn-email-report" title="Email the same report via Postmark (configure in ⚙ API Keys)">✉ Email</button>
     <button class="small" id="btn-triage" title="Problems-only report: every flag grouped by failure class with recommended actions">🚑 Triage</button>
+    <button class="small" id="btn-insights" title="AI insight brief on the current fleet state (Claude — set ANTHROPIC_API_KEY in ⚙ API Keys)">✨ Insights</button>
     <span class="vsep"></span>
     <label style="font-size:12px;color:var(--dim);white-space:nowrap" title="Probe a domain's hostnames automatically when its accordion opens"><input type="checkbox" id="autoprobe-toggle"> auto-probe</label>
     <span style="color:var(--dim);font-size:12px">⏱</span>
@@ -870,7 +872,7 @@ async function api(path, opts = {}) {
 
 /* ---------- settings ---------- */
 
-const CFG_KEYS = ['PROVIDER', 'ENOM_UID', 'ENOM_PW', 'ENOM_ENV', 'GODADDY_KEY', 'GODADDY_SECRET', 'NAMECHEAP_USER', 'NAMECHEAP_KEY', 'NAMECHEAP_CLIENT_IP', 'PORKBUN_KEY', 'PORKBUN_SECRET', 'CF_API_TOKEN', 'CF_ACCOUNT_ID', 'POSTMARK_TOKEN', 'REPORT_FROM', 'REPORT_TO', 'SPINUPWP_TOKEN', 'MAINWP_URL', 'MAINWP_KEY', 'MAINWP_SECRET'];
+const CFG_KEYS = ['PROVIDER', 'ENOM_UID', 'ENOM_PW', 'ENOM_ENV', 'GODADDY_KEY', 'GODADDY_SECRET', 'NAMECHEAP_USER', 'NAMECHEAP_KEY', 'NAMECHEAP_CLIENT_IP', 'PORKBUN_KEY', 'PORKBUN_SECRET', 'CF_API_TOKEN', 'CF_ACCOUNT_ID', 'POSTMARK_TOKEN', 'REPORT_FROM', 'REPORT_TO', 'SPINUPWP_TOKEN', 'MAINWP_URL', 'MAINWP_KEY', 'MAINWP_SECRET', 'ANTHROPIC_API_KEY'];
 const SELECT_KEYS = new Set(['PROVIDER', 'ENOM_ENV']);
 
 function syncProviderFields() {
@@ -1139,6 +1141,7 @@ function renderDetail(card, d) {
       <button class="small act-probe-hosts" ${d.zone ? '' : 'disabled'} title="Probe every hostname in this zone">🔦 probe hosts</button>
       <button class="small act-diag" ${d.zone ? '' : 'disabled'} title="Deep site diagnostic (redirects, headers, indexability, content sanity)">🩺 diagnose</button>
       <button class="small act-report" title="Download a Markdown report for this domain">📄</button>
+      <button class="small act-insights" title="AI insight brief for this domain (Claude)">✨</button>
       <button class="small act-email-report" title="Email this domain's report via Postmark">✉</button>
       <button class="small act-reload">↻</button>
       <span style="color:var(--dim);font-size:12px">${counts.same} same · ${counts['enom-only']} missing in CF · ${counts['cf-only']} CF-only</span>
@@ -1493,6 +1496,10 @@ function renderDetail(card, d) {
     const { html, date } = composeReportHtml([domain]);
     downloadText(`report-${domain}-${date}.html`, `<!doctype html><meta charset="utf-8"><title>${domain} — DNS report</title>${html}`);
     toast(`Report downloaded for ${domain}.`, 'ok');
+  };
+
+  $('.act-insights', el).onclick = () => {
+    runInsights(mdForDomain(domain), domain);
   };
 
   $('.act-email-report', el).onclick = () => {
@@ -2316,6 +2323,29 @@ function autoEmailRun(kind, targets) {
   }).then((r) => toast(`${kind} report emailed to ${r.to}.`, 'ok'))
     .catch((err) => toast(`Auto-email failed: ${err.message}`, 'err'));
 }
+
+/* ---------- AI insights ---------- */
+
+async function runInsights(context, label) {
+  pbLogReset();
+  pbLog(`<div><b>✨ Insights — ${esc(label)}</b> <span style="color:var(--dim)">asking Claude (claude-opus-5)… this can take a minute or two</span></div>`);
+  try {
+    const r = await api('/api/insights', { body: { context } });
+    pbLog(`<div style="margin-top:8px;white-space:pre-wrap;font-family:-apple-system,'Segoe UI',sans-serif;font-size:13.5px;line-height:1.6">${esc(r.text)}</div>`);
+    pbLog(`<div style="margin-top:8px;color:var(--dim);font-size:11.5px">— ${esc(r.model)} · ${r.usage?.input_tokens ?? '?'} in / ${r.usage?.output_tokens ?? '?'} out tokens · ⬇ export to save</div>`);
+  } catch (err) {
+    pbLog(`<div style="color:var(--red)">✗ ${esc(err.message)}</div>`);
+  }
+}
+
+$('#btn-insights').onclick = () => {
+  const targets = reportTargets();
+  if (!targets.length) { toast('Nothing to analyze.', 'err'); return; }
+  if (!Object.keys(state.scan).length) { toast('Run a Scan first so there is data to analyze.', 'err'); return; }
+  const { md } = composeBulkMd(targets);
+  const { md: triageMd } = composeTriageMd();
+  runInsights(`${md}\n\n---\n\n${triageMd}`, `fleet (${targets.length} domains)`);
+};
 
 /* ---------- diagnostic sweeper ---------- */
 
