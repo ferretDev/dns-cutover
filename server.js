@@ -19,6 +19,7 @@ import { analyzeMail } from './lib/mailcheck.js';
 import { getRollbacks, saveRollback, markRolledBack } from './lib/rollback.js';
 import { getPlaybooks, savePlaybook, deletePlaybook } from './lib/playbooks.js';
 import { getTransfers, recordTransfer } from './lib/transfers.js';
+import * as spinup from './lib/spinupwp.js';
 
 const root = dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 8899);
@@ -717,6 +718,52 @@ const routes = {
     const { subject, markdown, html, to } = await readBody(req);
     if (!subject || !markdown) throw new Error('subject and markdown are required');
     return sendReportEmail(subject, markdown, html, to);
+  },
+
+  'GET /api/spinup/board': async () => {
+    const [servers, sites, zones] = await Promise.all([spinup.listServers(), spinup.listSites(), cloudflare.listZones()]);
+    const serverById = new Map(servers.map((s) => [s.id, s]));
+    const zoneNames = new Set(zones.map((z) => z.name.toLowerCase()));
+    const siteNames = new Set();
+    const rows = sites.map((s) => {
+      const domain = String(s.domain || '').toLowerCase();
+      siteNames.add(domain);
+      for (const ad of s.additional_domains || []) siteNames.add(String(ad.domain || ad).toLowerCase());
+      const b = s.backups || {};
+      return {
+        id: s.id,
+        domain,
+        server: serverById.get(s.server_id)?.name || `#${s.server_id}`,
+        php: s.php_version || '?',
+        wp: !!s.is_wordpress,
+        backups: (b.next_run_time || b.files || b.database) ? 'on' : 'off',
+        https: s.https?.enabled ?? s.https_enabled ?? null,
+        inCf: zoneNames.has(domain),
+      };
+    });
+    rows.sort((a, b) => a.domain.localeCompare(b.domain));
+    // Active CF zones with no SpinupWP site = the missing-vhost / 520 class.
+    const missingSites = zones
+      .filter((z) => z.status === 'active' && !siteNames.has(z.name) && !siteNames.has(`www.${z.name}`))
+      .map((z) => z.name)
+      .sort();
+    return {
+      servers: servers.map((s) => ({ id: s.id, name: s.name, ip: s.ip_address })),
+      sites: rows,
+      missingSites,
+    };
+  },
+
+  'POST /api/spinup/bulk': async (req) => {
+    const { action, siteIds = [], value } = await readBody(req);
+    const results = await pooled(siteIds, 3, async (id) => {
+      if (action === 'backup') await spinup.backupSite(id);
+      else if (action === 'php') await spinup.updateSite(id, { php_version: String(value) });
+      else if (action === 'patch') await spinup.updateSite(id, JSON.parse(value));
+      else throw new Error(`Unknown action "${action}"`);
+      return { id, ok: true };
+    });
+    return { results };
   },
 
   'GET /api/pending-status': async () => {

@@ -253,6 +253,7 @@
   <h1>dns-cutover <span>· Enom → Cloudflare migration desk</span></h1>
   <div class="spacer"></div>
   <button id="btn-refresh">↻ Refresh domains</button>
+  <button id="btn-hosting">🖥 Hosting</button>
   <button id="btn-tools">🛠 Tools</button>
   <button id="btn-settings">⚙ API Keys</button>
 </header>
@@ -289,6 +290,7 @@
       <div><label>Postmark server token (for emailed reports)</label><input id="cfg-POSTMARK_TOKEN" type="password" autocomplete="off"></div>
       <div><label>Report sender (verified Postmark signature)</label><input id="cfg-REPORT_FROM" autocomplete="off" placeholder="reports@yourdomain.com"></div>
       <div><label>Default report recipient</label><input id="cfg-REPORT_TO" autocomplete="off" placeholder="you@yourdomain.com"></div>
+      <div><label>SpinupWP API token (🖥 Hosting board)</label><input id="cfg-SPINUPWP_TOKEN" type="password" autocomplete="off"></div>
     </div>
     <button class="primary" id="btn-save-cfg">Save keys</button>
     <button id="btn-test-cfg">Test connections</button>
@@ -393,6 +395,23 @@
       <div id="dmarc-results" style="margin-top:8px"></div>
     </div></details>
   </div>
+  </aside>
+
+  <aside id="hosting" class="drawer" aria-label="Hosting (SpinupWP)">
+    <div class="drawer-head">🖥 Hosting <span class="sub">SpinupWP — servers, sites, bulk ops (beta)</span><span class="spacer"></span><button class="small" onclick="closeDrawers()">✕</button></div>
+    <div class="drawer-body">
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap">
+        <button class="small" id="btn-spinup-load">↻ Load board</button>
+        <span class="vsep"></span>
+        <button class="small primary" id="sw-backup" disabled>💾 Backup now</button>
+        <button class="small" id="sw-php" disabled>🐘 Set PHP version…</button>
+        <button class="small" id="sw-patch" disabled>⚙ Apply settings JSON…</button>
+        <span id="sw-count" style="font-size:12px;color:var(--dim)"></span>
+      </div>
+      <div id="spinup-servers" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px"></div>
+      <div id="spinup-missing"></div>
+      <div id="spinup-results"></div>
+    </div>
   </aside>
 
   <div id="dash"></div>
@@ -834,7 +853,7 @@ async function api(path, opts = {}) {
 
 /* ---------- settings ---------- */
 
-const CFG_KEYS = ['PROVIDER', 'ENOM_UID', 'ENOM_PW', 'ENOM_ENV', 'GODADDY_KEY', 'GODADDY_SECRET', 'NAMECHEAP_USER', 'NAMECHEAP_KEY', 'NAMECHEAP_CLIENT_IP', 'PORKBUN_KEY', 'PORKBUN_SECRET', 'CF_API_TOKEN', 'CF_ACCOUNT_ID', 'POSTMARK_TOKEN', 'REPORT_FROM', 'REPORT_TO'];
+const CFG_KEYS = ['PROVIDER', 'ENOM_UID', 'ENOM_PW', 'ENOM_ENV', 'GODADDY_KEY', 'GODADDY_SECRET', 'NAMECHEAP_USER', 'NAMECHEAP_KEY', 'NAMECHEAP_CLIENT_IP', 'PORKBUN_KEY', 'PORKBUN_SECRET', 'CF_API_TOKEN', 'CF_ACCOUNT_ID', 'POSTMARK_TOKEN', 'REPORT_FROM', 'REPORT_TO', 'SPINUPWP_TOKEN'];
 const SELECT_KEYS = new Set(['PROVIDER', 'ENOM_ENV']);
 
 function syncProviderFields() {
@@ -1500,6 +1519,82 @@ function toggleDetail(card) {
 $('#btn-tools').onclick = () => {
   $('#tools').classList.contains('open') ? closeDrawers() : openDrawer('#tools');
 };
+
+/* ---------- hosting (SpinupWP) ---------- */
+
+let swSites = [];
+
+$('#btn-hosting').onclick = () => {
+  if ($('#hosting').classList.contains('open')) { closeDrawers(); return; }
+  openDrawer('#hosting');
+  if (!swSites.length) $('#btn-spinup-load').click();
+};
+
+function renderSpinupBoard(data) {
+  swSites = data.sites;
+  $('#spinup-servers').innerHTML = data.servers.map((s) =>
+    `<span class="chip" title="${esc(s.ip || '')}">🖥 ${esc(s.name)} <span style="color:var(--dim)">· ${data.sites.filter((x) => x.server === s.name).length} sites</span></span>`).join('');
+  $('#spinup-missing').innerHTML = data.missingSites.length ? `
+    <div class="warnings" style="margin:0 0 10px">⚠ ${data.missingSites.length} active Cloudflare zone(s) with NO SpinupWP site — likely the missing-vhost / 520 class:<br>
+    ${data.missingSites.map(esc).join(' · ')}</div>` : '';
+  $('#spinup-results').innerHTML = `
+    <table>
+      <thead><tr><th><input type="checkbox" class="sw-all"></th><th>Site</th><th>Server</th><th>PHP</th><th>WP</th><th>Backups</th><th>CF zone</th></tr></thead>
+      <tbody>${data.sites.map((s, i) => `
+        <tr>
+          <td class="sel"><input type="checkbox" class="sw-row" data-i="${i}"></td>
+          <td style="font-family:var(--mono);font-size:12px">${esc(s.domain)}</td>
+          <td style="font-family:var(--mono);font-size:12px;color:var(--dim)">${esc(s.server)}</td>
+          <td style="font-family:var(--mono);font-size:12px">${esc(s.php)}</td>
+          <td style="font-family:var(--mono);font-size:12px">${s.wp ? 'WP' : '—'}</td>
+          <td>${s.backups === 'on' ? '<span class="badge active">on</span>' : '<span class="badge none">off</span>'}</td>
+          <td>${s.inCf ? '<span class="badge pointed">in CF</span>' : '<span class="badge">not in CF</span>'}</td>
+        </tr>`).join('')}
+      </tbody>
+    </table>`;
+  const refresh = () => {
+    const n = $$('.sw-row:checked').length;
+    ['#sw-backup', '#sw-php', '#sw-patch'].forEach((id) => { $(id).disabled = !n; });
+    $('#sw-count').textContent = n ? `${n} selected` : '';
+  };
+  $('.sw-all').onchange = (e) => { $$('.sw-row').forEach((cb) => { cb.checked = e.target.checked; }); refresh(); };
+  $$('.sw-row').forEach((cb) => { cb.onchange = refresh; });
+}
+
+$('#btn-spinup-load').onclick = async () => {
+  const box = $('#spinup-results');
+  box.innerHTML = '<div class="loading">Loading servers + sites from SpinupWP…</div>';
+  try {
+    const data = await api('/api/spinup/board');
+    renderSpinupBoard(data);
+    toast(`SpinupWP: ${data.servers.length} server(s), ${data.sites.length} site(s)${data.missingSites.length ? ` — ⚠ ${data.missingSites.length} zone(s) without a site` : ''}.`, data.missingSites.length ? 'err' : 'ok');
+  } catch (err) { box.innerHTML = `<div class="errors">✗ ${esc(err.message)}${err.message.includes('SPINUPWP_TOKEN') ? ' — add the token in ⚙ API Keys' : ''}</div>`; }
+};
+
+async function swBulk(action) {
+  const items = $$('.sw-row:checked').map((cb) => swSites[Number(cb.dataset.i)]);
+  if (!items.length) return;
+  let value;
+  if (action === 'php') {
+    value = prompt(`PHP version for ${items.length} site(s) (e.g. 8.3):`, '8.3');
+    if (!value?.trim()) return;
+  }
+  if (action === 'patch') {
+    value = prompt(`Settings JSON to PATCH onto ${items.length} site(s) — SpinupWP site fields, e.g. {"php_version":"8.3"}:`, '{}');
+    if (!value?.trim() || value.trim() === '{}') return;
+    try { JSON.parse(value); } catch { toast('Invalid JSON.', 'err'); return; }
+  }
+  if (!confirm(`${action === 'backup' ? 'Trigger backups on' : action === 'php' ? `Set PHP ${value} on` : 'Apply settings to'} ${items.length} site(s)?`)) return;
+  try {
+    const { results } = await api('/api/spinup/bulk', { body: { action, siteIds: items.map((i) => i.id), value } });
+    const bad = results.filter((r) => !r || r.error || r.ok === false);
+    bad.length ? toast(`${bad.length} failed: ${bad[0].error || ''}`, 'err') : toast(`${results.length} site(s) done.`, 'ok');
+    if (action !== 'backup') $('#btn-spinup-load').click();
+  } catch (err) { toast(err.message, 'err'); }
+}
+$('#sw-backup').onclick = () => swBulk('backup');
+$('#sw-php').onclick = () => swBulk('php');
+$('#sw-patch').onclick = () => swBulk('patch');
 
 /* ---------- playbook editor ---------- */
 
