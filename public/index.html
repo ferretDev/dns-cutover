@@ -419,6 +419,7 @@
           <b>📦 WordPress updates</b> <span style="color:var(--dim);font-size:12px">via MainWP</span>
           <span class="vsep"></span>
           <button class="small" id="btn-wp-load">↻ Load updates</button>
+          <button class="small" id="btn-wp-sync" title="Trigger a MainWP child-site sync — refreshes stale pending-update counts">🔄 Sync counts</button>
           <button class="small primary" id="wp-plugins" disabled>🔌 Update plugins</button>
           <button class="small" id="wp-themes" disabled>🎨 Themes</button>
           <button class="small" id="wp-core" disabled>⬆ Core</button>
@@ -1670,6 +1671,16 @@ async function wpBulk(what) {
     $('#btn-wp-load').click();
   } catch (err) { toast(err.message, 'err'); }
 }
+$('#btn-wp-sync').onclick = async () => {
+  const btn = $('#btn-wp-sync');
+  btn.disabled = true;
+  try {
+    const r = await api('/api/wp/sync', { body: {} });
+    toast(`${r.message} Reload updates in a minute or two.`, 'ok');
+  } catch (err) { toast(err.message, 'err'); }
+  btn.disabled = false;
+};
+
 $('#wp-plugins').onclick = () => wpBulk('plugins');
 $('#wp-themes').onclick = () => wpBulk('themes');
 $('#wp-core').onclick = () => wpBulk('wordpress');

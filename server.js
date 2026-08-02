@@ -780,6 +780,11 @@ const routes = {
     };
   },
 
+  'POST /api/wp/sync': async () => {
+    await mainwp.syncAll();
+    return { ok: true, message: 'Sync triggered — counts refresh as child sites report in.' };
+  },
+
   'POST /api/wp/bulk': async (req) => {
     const { what, siteIds = [] } = await readBody(req);
     const kinds = what === 'all' ? ['plugins', 'themes', 'wordpress'] : [what];
